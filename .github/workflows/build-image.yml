@@ -74,9 +74,7 @@ jobs:
 
       - name: Image version label
         run: |
-          if [ "${GITHUB_REF}" = "refs/heads/feat/docker-cicd-redesign" ]; then
-            echo "VERSION_LABEL=feat-docker-cicd-redesign" >> "$GITHUB_ENV"
-          elif [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+          if [ "${GITHUB_REF_TYPE}" = "branch" ] || [ "${GITHUB_REF_TYPE}" = "tag" ]; then
             echo "VERSION_LABEL=${GITHUB_REF_NAME}" >> "$GITHUB_ENV"
           else
             echo "VERSION_LABEL=${GITHUB_SHA}" >> "$GITHUB_ENV"
@@ -88,9 +86,9 @@ jobs:
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           tags: |
-            type=raw,value=feat-docker-cicd-redesign,enable=${{ github.ref == 'refs/heads/feat/docker-cicd-redesign' }}
-            type=raw,value=${{ github.sha }},enable=${{ github.ref != 'refs/heads/feat/docker-cicd-redesign' }}
-            type=sha,format=short,prefix=sha-,enable=${{ github.ref != 'refs/heads/feat/docker-cicd-redesign' }}
+            type=ref,event=branch
+            type=raw,value=${{ github.sha }}
+            type=sha,format=short,prefix=sha-
             type=ref,event=tag
             type=semver,pattern={{raw}}
 
