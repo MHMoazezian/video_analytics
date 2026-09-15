@@ -33,6 +33,7 @@ from app.geometry.config import load_camera_config
 from app.fleet.supervisor import fleet_supervisor
 from app.management.api import rollup_worker, router as management_router
 from app.management.repository import analytics_repository
+from app.insights import VideoInsightError, VideoInsightService
 from app.tracking.factory import available_tracker_types, public_tracker_catalog
 
 
@@ -54,6 +55,7 @@ manager = JobManager(
     processing_width=int(os.environ.get("VIDEO_ANALYTICS_PROCESSING_WIDTH", "1280")),
     frame_stride=int(os.environ.get("VIDEO_ANALYTICS_FRAME_STRIDE", "10")),
 )
+video_insight_service = VideoInsightService()
 
 app = FastAPI(title="Video Analytics MVP API", version="0.1.0")
 origins = [
@@ -140,6 +142,30 @@ class StreamFrameRequest(BaseModel):
     @classmethod
     def validate_stream_url(cls, value: str) -> str:
         return require_rtsp_url(value)
+
+
+class StreamVideoInsightRequest(BaseModel):
+    """Interpret a short sequence sampled from a live RTSP source."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    stream_url: str = Field(min_length=1, max_length=2048)
+    query: str = Field(min_length=1, max_length=4000)
+    num_frames: int = Field(default=8, ge=2, le=16)
+    max_new_tokens: int = Field(default=160, ge=16, le=512)
+
+    @field_validator("stream_url")
+    @classmethod
+    def validate_stream_url(cls, value: str) -> str:
+        return require_rtsp_url(value)
+
+    @field_validator("query")
+    @classmethod
+    def validate_query(cls, value: str) -> str:
+        candidate = value.strip()
+        if not candidate:
+            raise ValueError("query must not be blank")
+        return candidate
 
 
 @app.get("/health")
@@ -318,6 +344,70 @@ def live_camera_preview(request: StreamFrameRequest) -> StreamingResponse:
         media_type="multipart/x-mixed-replace; boundary=frame",
         headers={"Cache-Control": "no-store", "X-Accel-Buffering": "no"},
     )
+
+
+@app.post("/api/v1/video-insights")
+async def interpret_recorded_video(
+    video: Annotated[UploadFile, File(...)],
+    query: Annotated[str, Form(min_length=1, max_length=4000)],
+    num_frames: Annotated[int, Form(ge=2, le=16)] = 8,
+    max_new_tokens: Annotated[int, Form(ge=16, le=512)] = 160,
+) -> dict[str, object]:
+    """Answer a query about uniformly sampled frames from an uploaded video."""
+
+    video_suffix = Path(video.filename or "").suffix.lower()
+    if video_suffix not in ALLOWED_VIDEO_SUFFIXES:
+        raise HTTPException(status_code=422, detail="unsupported recorded-video file type")
+    query = query.strip()
+    if not query:
+        raise HTTPException(status_code=422, detail="query must not be blank")
+    JOBS_ROOT.mkdir(parents=True, exist_ok=True)
+    try:
+        with tempfile.TemporaryDirectory(dir=JOBS_ROOT) as scratch_dir:
+            video_path = Path(scratch_dir) / f"input{video_suffix}"
+            await _save_upload(video, video_path, limit=MAX_UPLOAD_BYTES)
+            from app.insights.service import extract_video_frames
+
+            frames = await asyncio.to_thread(
+                extract_video_frames, video_path, num_frames=num_frames
+            )
+            result = await asyncio.to_thread(
+                video_insight_service.interpret,
+                frames,
+                query,
+                max_new_tokens=max_new_tokens,
+            )
+    except VideoInsightError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    finally:
+        await video.close()
+    return {"data": result}
+
+
+@app.post("/api/v1/video-insights/from-stream")
+async def interpret_live_video(request: StreamVideoInsightRequest) -> dict[str, object]:
+    """Answer a query about consecutive frames from a live camera."""
+
+    from app.insights.service import extract_stream_frames
+
+    try:
+        frames = await asyncio.to_thread(
+            extract_stream_frames,
+            request.stream_url,
+            num_frames=request.num_frames,
+            sample_interval_seconds=float(
+                os.environ.get("VIDEO_INSIGHT_LIVE_SAMPLE_INTERVAL_SECONDS", "0.75")
+            ),
+        )
+        result = await asyncio.to_thread(
+            video_insight_service.interpret,
+            frames,
+            request.query,
+            max_new_tokens=request.max_new_tokens,
+        )
+    except VideoInsightError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    return {"data": result}
 
 
 @app.post("/api/v1/jobs", status_code=202)
