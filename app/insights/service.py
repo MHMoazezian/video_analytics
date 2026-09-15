@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+import re
 from threading import Lock
 import time
 from typing import Any
@@ -14,6 +15,9 @@ import numpy as np
 
 class VideoInsightError(RuntimeError):
     """A user-facing video interpretation failure."""
+
+
+PERSIAN_TEXT = re.compile(r"[\u0600-\u06ff]")
 
 
 def extract_video_frames(video_path: str | Path, *, num_frames: int = 8) -> list[np.ndarray]:
@@ -92,6 +96,11 @@ class VideoInsightService:
         self._load_lock = Lock()
         self._inference_lock = Lock()
 
+    def preload(self) -> None:
+        """Load model weights before the first dashboard request."""
+
+        self._load()
+
     def _load(self) -> tuple[Any, Any, Any]:
         try:
             import torch
@@ -143,49 +152,119 @@ class VideoInsightService:
         frames: list[np.ndarray],
         query: str,
         *,
-        max_new_tokens: int = 160,
+        max_new_tokens: int = 80,
+        detailed: bool = False,
     ) -> dict[str, object]:
         if not frames:
             raise VideoInsightError("at least one frame is required")
         model, processor, torch = self._load()
-        content = [{"type": "image", "image": frame} for frame in frames]
-        content.append(
-            {
+        original_query = query.strip()
+        translated_query = original_query
+        translation_seconds = 0.0
+        with self._inference_lock, torch.inference_mode():
+            if PERSIAN_TEXT.search(original_query):
+                translated_query, elapsed = self._generate(
+                    model,
+                    processor,
+                    torch,
+                    [{
+                        "role": "user",
+                        "content": (
+                            "Translate the following Persian video-analysis question into natural "
+                            "English. Preserve its exact intent. Output only the English translation.\n\n"
+                            f"{original_query}"
+                        ),
+                    }],
+                    max_new_tokens=64,
+                )
+                translation_seconds += elapsed
+
+            answer_style = (
+                "Give a detailed chronological analysis. Describe all relevant people, objects, "
+                "actions, and changes across the frames; explain evidence related to the query, "
+                "and clearly state uncertainty. Do not infer facts unsupported by the frames."
+                if detailed
+                else "Give a concise general answer focused on the user query."
+            )
+            content = [{"type": "image", "image": frame} for frame in frames]
+            content.append({
                 "type": "text",
                 "text": (
-                    "These are consecutive frames from a video, ordered from oldest to newest. "
-                    "Analyze the sequence and answer the user's query briefly and precisely, "
-                    "using the same language as the query.\n\n"
-                    f"User query: {query.strip()}"
+                    "These are consecutive frames from a CCTV video, ordered from oldest to newest. "
+                    "Analyze the sequence and answer the user query in English. Mention only details "
+                    f"supported by the frames. {answer_style}\n\n"
+                    f"User query: {translated_query}"
                 ),
-            }
-        )
-        messages = [{"role": "user", "content": content}]
+            })
+            english_answer, inference_seconds = self._generate(
+                model,
+                processor,
+                torch,
+                [{"role": "user", "content": content}],
+                images=frames,
+                max_new_tokens=max_new_tokens,
+            )
+            persian_answer, elapsed = self._generate(
+                model,
+                processor,
+                torch,
+                [{
+                    "role": "user",
+                    "content": (
+                        "Translate the following English video-analysis answer into fluent Persian. "
+                        "Preserve all facts and uncertainty. Output only the Persian translation.\n\n"
+                        f"{english_answer}"
+                    ),
+                }],
+                max_new_tokens=min(512, max_new_tokens * 2),
+            )
+            translation_seconds += elapsed
+
+        return {
+            "text": persian_answer or english_answer,
+            "english_text": english_answer,
+            "translated_query": translated_query,
+            "detailed": detailed,
+            "frame_count": len(frames),
+            "inference_seconds": round(inference_seconds, 3),
+            "translation_seconds": round(translation_seconds, 3),
+            "total_seconds": round(inference_seconds + translation_seconds, 3),
+            "model": Path(self.model_path).name,
+        }
+
+    @staticmethod
+    def _generate(
+        model: Any,
+        processor: Any,
+        torch: Any,
+        messages: list[dict[str, Any]],
+        *,
+        images: list[np.ndarray] | None = None,
+        max_new_tokens: int,
+    ) -> tuple[str, float]:
         prompt = processor.apply_chat_template(
             messages, tokenize=False, add_generation_prompt=True
         )
-        inputs = processor(text=[prompt], images=frames, return_tensors="pt")
-        device = next(model.parameters()).device
-        inputs = inputs.to(device)
+        processor_options: dict[str, Any] = {
+            "text": [prompt],
+            "return_tensors": "pt",
+        }
+        if images is not None:
+            processor_options["images"] = images
+        inputs = processor(**processor_options).to(next(model.parameters()).device)
         if torch.cuda.is_available():
             torch.cuda.synchronize()
         started = time.perf_counter()
-        with self._inference_lock, torch.inference_mode():
-            output = model.generate(
-                **inputs,
-                max_new_tokens=max_new_tokens,
-                do_sample=False,
-            )
+        output = model.generate(
+            **inputs,
+            max_new_tokens=max_new_tokens,
+            do_sample=False,
+        )
         if torch.cuda.is_available():
             torch.cuda.synchronize()
         elapsed = time.perf_counter() - started
         generated = output[:, inputs.input_ids.shape[1] :]
-        answer = processor.batch_decode(
+        text = processor.batch_decode(
             generated, skip_special_tokens=True, clean_up_tokenization_spaces=False
         )[0].strip()
-        return {
-            "text": answer,
-            "frame_count": len(frames),
-            "inference_seconds": round(elapsed, 3),
-            "model": Path(self.model_path).name,
-        }
+        return text, elapsed

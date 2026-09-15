@@ -17,6 +17,11 @@ on CUDA, and deterministic generation. `POST /api/v1/video-insights` accepts a
 recorded upload plus `query`; `POST /api/v1/video-insights/from-stream` samples
 a live RTSP sequence. The model is loaded lazily from
 `VIDEO_INSIGHT_MODEL_PATH` and is deliberately not copied into the image.
+Production enables `VIDEO_INSIGHT_PRELOAD`, avoiding model-loading latency on
+the first dashboard query. Persian questions are translated to English with a
+short text-only Qwen pass, video reasoning stays in English, and the English
+answer is translated back to Persian for display. The visual generation limit
+matches the optimized experiment at 80 new tokens.
 
 ## Planned scope
 

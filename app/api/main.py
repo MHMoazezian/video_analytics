@@ -80,6 +80,10 @@ async def start_analytics_store() -> None:
     analytics_repository.open()
     app.state.analytics_rollup_task = asyncio.create_task(rollup_worker())
     app.state.fleet_task = asyncio.create_task(asyncio.to_thread(fleet_supervisor.start))
+    if os.environ.get("VIDEO_INSIGHT_PRELOAD", "false").strip().lower() in {
+        "1", "true", "yes", "on"
+    }:
+        await asyncio.to_thread(video_insight_service.preload)
 
 
 @app.on_event("shutdown")
@@ -152,7 +156,8 @@ class StreamVideoInsightRequest(BaseModel):
     stream_url: str = Field(min_length=1, max_length=2048)
     query: str = Field(min_length=1, max_length=4000)
     num_frames: int = Field(default=8, ge=2, le=16)
-    max_new_tokens: int = Field(default=160, ge=16, le=512)
+    max_new_tokens: int = Field(default=80, ge=16, le=512)
+    detailed: bool = False
 
     @field_validator("stream_url")
     @classmethod
@@ -351,7 +356,8 @@ async def interpret_recorded_video(
     video: Annotated[UploadFile, File(...)],
     query: Annotated[str, Form(min_length=1, max_length=4000)],
     num_frames: Annotated[int, Form(ge=2, le=16)] = 8,
-    max_new_tokens: Annotated[int, Form(ge=16, le=512)] = 160,
+    max_new_tokens: Annotated[int, Form(ge=16, le=512)] = 80,
+    detailed: Annotated[bool, Form()] = False,
 ) -> dict[str, object]:
     """Answer a query about uniformly sampled frames from an uploaded video."""
 
@@ -376,6 +382,7 @@ async def interpret_recorded_video(
                 frames,
                 query,
                 max_new_tokens=max_new_tokens,
+                detailed=detailed,
             )
     except VideoInsightError as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
@@ -404,6 +411,7 @@ async def interpret_live_video(request: StreamVideoInsightRequest) -> dict[str, 
             frames,
             request.query,
             max_new_tokens=request.max_new_tokens,
+            detailed=request.detailed,
         )
     except VideoInsightError as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
