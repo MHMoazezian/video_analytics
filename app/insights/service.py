@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
 import re
@@ -17,11 +18,41 @@ class VideoInsightError(RuntimeError):
     """A user-facing video interpretation failure."""
 
 
-PERSIAN_TEXT = re.compile(r"[\u0600-\u06ff]")
+FIGHT_QUESTION = "Are there persons fighting in the video?"
+FLOOR_CLEAN_QUESTION = "Is the floor of the scene clean?"
 
 
-def extract_video_frames(video_path: str | Path, *, num_frames: int = 8) -> list[np.ndarray]:
-    """Return evenly spaced RGB frames without decoding the entire file."""
+def _parse_yes_no_answers(raw_output: str) -> dict[str, str]:
+    """Convert the private model response into the public two-answer contract."""
+
+    candidate = raw_output.strip()
+    json_object = re.search(r"\{.*\}", candidate, flags=re.DOTALL)
+    if json_object:
+        candidate = json_object.group(0)
+    try:
+        payload = json.loads(candidate)
+    except (TypeError, json.JSONDecodeError) as exc:
+        raise VideoInsightError("the video answers could not be determined") from exc
+
+    def normalize(key: str) -> str:
+        value = payload.get(key) if isinstance(payload, dict) else None
+        if isinstance(value, bool):
+            return "Yes" if value else "No"
+        if isinstance(value, str) and value.strip().lower() in {"yes", "no"}:
+            return value.strip().title()
+        raise VideoInsightError("the video answers could not be determined")
+
+    return {"fighting": normalize("fighting"), "floor_clean": normalize("floor_clean")}
+
+
+def extract_video_frames(
+    video_path: str | Path,
+    *,
+    num_frames: int = 8,
+    window_start_seconds: float | None = None,
+    window_end_seconds: float | None = None,
+) -> list[np.ndarray]:
+    """Return evenly spaced RGB frames from the requested video-time window."""
 
     capture = cv2.VideoCapture(str(video_path))
     try:
@@ -30,8 +61,19 @@ def extract_video_frames(video_path: str | Path, *, num_frames: int = 8) -> list
         total_frames = int(capture.get(cv2.CAP_PROP_FRAME_COUNT))
         if total_frames <= 0:
             raise VideoInsightError("video does not contain any decodable frames")
-        count = min(num_frames, total_frames)
-        indexes = np.linspace(0, total_frames - 1, num=count, dtype=int)
+        first_index = 0
+        last_index = total_frames - 1
+        if window_start_seconds is not None or window_end_seconds is not None:
+            fps = float(capture.get(cv2.CAP_PROP_FPS))
+            if fps <= 0:
+                raise VideoInsightError("video frame rate is unavailable")
+            first_index = max(0, int((window_start_seconds or 0.0) * fps))
+            requested_end = window_end_seconds if window_end_seconds is not None else total_frames / fps
+            last_index = min(total_frames - 1, max(first_index, int(requested_end * fps) - 1))
+            if first_index >= total_frames:
+                raise VideoInsightError("video time window is outside the recording")
+        count = min(num_frames, last_index - first_index + 1)
+        indexes = np.linspace(first_index, last_index, num=count, dtype=int)
         frames: list[np.ndarray] = []
         for index in indexes:
             capture.set(cv2.CAP_PROP_POS_FRAMES, int(index))
@@ -147,89 +189,38 @@ class VideoInsightService:
             self._model = model
         return self._model, self._processor, torch
 
-    def interpret(
-        self,
-        frames: list[np.ndarray],
-        query: str,
-        *,
-        max_new_tokens: int = 80,
-        detailed: bool = False,
-    ) -> dict[str, object]:
+    def interpret(self, frames: list[np.ndarray]) -> dict[str, object]:
+        """Return only normalized answers; never expose generated model text."""
+
         if not frames:
             raise VideoInsightError("at least one frame is required")
         model, processor, torch = self._load()
-        original_query = query.strip()
-        translated_query = original_query
-        translation_seconds = 0.0
         with self._inference_lock, torch.inference_mode():
-            if PERSIAN_TEXT.search(original_query):
-                translated_query, elapsed = self._generate(
-                    model,
-                    processor,
-                    torch,
-                    [{
-                        "role": "user",
-                        "content": (
-                            "Translate the following Persian video-analysis question into natural "
-                            "English. Preserve its exact intent. Output only the English translation.\n\n"
-                            f"{original_query}"
-                        ),
-                    }],
-                    max_new_tokens=64,
-                )
-                translation_seconds += elapsed
-
-            answer_style = (
-                "Give a detailed chronological analysis. Describe all relevant people, objects, "
-                "actions, and changes across the frames; explain evidence related to the query, "
-                "and clearly state uncertainty. Do not infer facts unsupported by the frames."
-                if detailed
-                else "Give a concise general answer focused on the user query."
-            )
             content = [{"type": "image", "image": frame} for frame in frames]
             content.append({
                 "type": "text",
                 "text": (
                     "These are consecutive frames from a CCTV video, ordered from oldest to newest. "
-                    "Analyze the sequence and answer the user query in English. Mention only details "
-                    f"supported by the frames. {answer_style}\n\n"
-                    f"User query: {translated_query}"
+                    "Answer both questions using only visible evidence. Treat uncertainty as No. "
+                    "Return exactly one JSON object with no prose or markdown. Each value must be "
+                    'either "Yes" or "No". Example: '
+                    '{"fighting":"No","floor_clean":"Yes"}.\n'
+                    f"1. {FIGHT_QUESTION}\n2. {FLOOR_CLEAN_QUESTION}"
                 ),
             })
-            english_answer, inference_seconds = self._generate(
+            raw_output, inference_seconds = self._generate(
                 model,
                 processor,
                 torch,
                 [{"role": "user", "content": content}],
                 images=frames,
-                max_new_tokens=max_new_tokens,
+                max_new_tokens=40,
             )
-            persian_answer, elapsed = self._generate(
-                model,
-                processor,
-                torch,
-                [{
-                    "role": "user",
-                    "content": (
-                        "Translate the following English video-analysis answer into fluent Persian. "
-                        "Preserve all facts and uncertainty. Output only the Persian translation.\n\n"
-                        f"{english_answer}"
-                    ),
-                }],
-                max_new_tokens=min(512, max_new_tokens * 2),
-            )
-            translation_seconds += elapsed
 
         return {
-            "text": persian_answer or english_answer,
-            "english_text": english_answer,
-            "translated_query": translated_query,
-            "detailed": detailed,
+            "answers": _parse_yes_no_answers(raw_output),
             "frame_count": len(frames),
             "inference_seconds": round(inference_seconds, 3),
-            "translation_seconds": round(translation_seconds, 3),
-            "total_seconds": round(inference_seconds + translation_seconds, 3),
-            "model": Path(self.model_path).name,
         }
 
     @staticmethod

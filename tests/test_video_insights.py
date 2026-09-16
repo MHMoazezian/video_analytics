@@ -4,12 +4,19 @@ import cv2
 import numpy as np
 from contextlib import nullcontext
 
-from app.insights.service import VideoInsightService, extract_stream_frames, extract_video_frames
+from app.insights.service import (
+    VideoInsightError,
+    VideoInsightService,
+    _parse_yes_no_answers,
+    extract_stream_frames,
+    extract_video_frames,
+)
 
 
 class _SeekableCapture:
-    def __init__(self, total: int = 12) -> None:
+    def __init__(self, total: int = 12, fps: float = 10.0) -> None:
         self.total = total
+        self.fps = fps
         self.index = 0
         self.released = False
 
@@ -17,7 +24,9 @@ class _SeekableCapture:
         return True
 
     def get(self, prop: int) -> float:
-        return float(self.total) if prop == cv2.CAP_PROP_FRAME_COUNT else 0.0
+        if prop == cv2.CAP_PROP_FRAME_COUNT:
+            return float(self.total)
+        return self.fps if prop == cv2.CAP_PROP_FPS else 0.0
 
     def set(self, prop: int, value: float) -> bool:
         if prop == cv2.CAP_PROP_POS_FRAMES:
@@ -44,6 +53,20 @@ def test_extract_video_frames_samples_uniformly_and_converts_to_rgb(monkeypatch)
     assert capture.released
 
 
+def test_extract_video_frames_samples_only_requested_time_window(monkeypatch) -> None:
+    capture = _SeekableCapture(total=120, fps=10)
+    monkeypatch.setattr(cv2, "VideoCapture", lambda _path: capture)
+
+    frames = extract_video_frames(
+        "sample.mp4",
+        num_frames=4,
+        window_start_seconds=2,
+        window_end_seconds=5,
+    )
+
+    assert [int(frame[0, 0, 2]) for frame in frames] == [20, 29, 39, 49]
+
+
 def test_extract_stream_frames_returns_consecutive_frames(monkeypatch) -> None:
     capture = _SeekableCapture()
 
@@ -63,83 +86,45 @@ def test_extract_stream_frames_returns_consecutive_frames(monkeypatch) -> None:
     assert capture.released
 
 
-def test_persian_query_is_translated_before_english_reasoning(monkeypatch) -> None:
+def test_interpret_returns_only_normalized_yes_no_answers(monkeypatch) -> None:
     service = VideoInsightService()
     fake_torch = type("FakeTorch", (), {"inference_mode": staticmethod(nullcontext)})
     monkeypatch.setattr(service, "_load", lambda: (object(), object(), fake_torch))
     calls: list[dict[str, object]] = []
-    responses = iter([
-        ("What are the people doing?", 0.2),
-        ("They are walking through a market.", 5.3),
-        ("آن‌ها در حال عبور از بازار هستند.", 0.4),
-    ])
 
     def fake_generate(*_args, **kwargs):
         calls.append(kwargs)
-        return next(responses)
+        return ('```json\n{"fighting": "yes", "floor_clean": false}\n```', 5.3)
 
     monkeypatch.setattr(service, "_generate", fake_generate)
-    result = service.interpret(
-        [np.zeros((4, 6, 3), dtype=np.uint8)] * 8,
-        "افراد چه کاری انجام می‌دهند؟",
-    )
+    result = service.interpret([np.zeros((4, 6, 3), dtype=np.uint8)] * 8)
 
-    assert result["translated_query"] == "What are the people doing?"
-    assert result["english_text"] == "They are walking through a market."
-    assert result["text"] == "آن‌ها در حال عبور از بازار هستند."
+    assert result["answers"] == {"fighting": "Yes", "floor_clean": "No"}
     assert result["inference_seconds"] == 5.3
-    assert result["translation_seconds"] == 0.6
-    assert [call["max_new_tokens"] for call in calls] == [64, 80, 160]
-    assert calls[0].get("images") is None
-    assert len(calls[1]["images"]) == 8  # type: ignore[arg-type]
+    assert set(result) == {"answers", "frame_count", "inference_seconds"}
+    assert len(calls) == 1
+    assert calls[0]["max_new_tokens"] == 40
+    assert len(calls[0]["images"]) == 8  # type: ignore[arg-type]
 
 
-def test_english_query_skips_input_translation(monkeypatch) -> None:
-    service = VideoInsightService()
-    fake_torch = type("FakeTorch", (), {"inference_mode": staticmethod(nullcontext)})
-    monkeypatch.setattr(service, "_load", lambda: (object(), object(), fake_torch))
-    calls: list[dict[str, object]] = []
-    responses = iter([
-        ("No abnormal activity is visible.", 5.0),
-        ("رفتار غیرعادی مشاهده نمی‌شود.", 0.3),
-    ])
-
-    def fake_generate(*_args, **kwargs):
-        calls.append(kwargs)
-        return next(responses)
-
-    monkeypatch.setattr(service, "_generate", fake_generate)
-    result = service.interpret(
-        [np.zeros((4, 6, 3), dtype=np.uint8)] * 8,
-        "Is there abnormal behavior?",
-    )
-
-    assert result["translated_query"] == "Is there abnormal behavior?"
-    assert len(calls) == 2
-    assert calls[0]["images"] is not None
+def test_answer_parser_rejects_free_form_model_output() -> None:
+    with np.testing.assert_raises(VideoInsightError):
+        _parse_yes_no_answers("There does not seem to be a fight.")
 
 
-def test_detailed_mode_adds_chronological_evidence_instructions(monkeypatch) -> None:
+def test_interpret_prompt_contains_both_fixed_questions(monkeypatch) -> None:
     service = VideoInsightService()
     fake_torch = type("FakeTorch", (), {"inference_mode": staticmethod(nullcontext)})
     monkeypatch.setattr(service, "_load", lambda: (object(), object(), fake_torch))
     prompts: list[object] = []
-    responses = iter([
-        ("A detailed English answer.", 5.0),
-        ("پاسخ فارسی با جزئیات.", 0.3),
-    ])
 
     def fake_generate(*args, **_kwargs):
         prompts.append(args[3])
-        return next(responses)
+        return ('{"fighting":"No","floor_clean":"Yes"}', 1.0)
 
     monkeypatch.setattr(service, "_generate", fake_generate)
-    result = service.interpret(
-        [np.zeros((4, 6, 3), dtype=np.uint8)] * 8,
-        "Describe the scene",
-        detailed=True,
-    )
+    service.interpret([np.zeros((4, 6, 3), dtype=np.uint8)] * 8)
 
     visual_content = prompts[0][0]["content"]  # type: ignore[index]
-    assert "detailed chronological analysis" in visual_content[-1]["text"]
-    assert result["detailed"] is True
+    assert "Are there persons fighting in the video?" in visual_content[-1]["text"]
+    assert "Is the floor of the scene clean?" in visual_content[-1]["text"]
