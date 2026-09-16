@@ -3,7 +3,7 @@ name: Build and push video-analytics image
 on:
   push:
     # TEMPORARY: feat/docker-cicd-redesign is for GHCR publish validation only.
-    branches: [master, main, development, feat/docker-cicd-redesign, feat-video-interpreting]
+    branches: [master, main, development, feat/docker-cicd-redesign, feat-video-interpreting, feat-fruit-quality]
     tags: ["v*"]
   workflow_dispatch:
 

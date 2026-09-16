@@ -21,6 +21,30 @@ class VideoInsightError(RuntimeError):
 FIGHT_QUESTION = "Are there persons fighting in the video?"
 FLOOR_CLEAN_QUESTION = "Is the floor of the scene clean?"
 
+FRUIT_QUALITY_PROMPT = """Evaluate the visible freshness of the fruits in these images. The images may be one photo or ordered samples from one video. Judge only visible fruit and summarize the whole scene; when video frames repeat the same fruits, do not treat each appearance as a different fruit.
+
+Use visible evidence such as natural color, discoloration, bruising, mold, soft or collapsed areas, wrinkling, dryness, and decay. Do not claim anything about taste, smell, internal quality, or food safety that cannot be seen. Ignore non-fruit objects. If no fruit is clearly visible, set has_fruit to false and use the label "نامشخص".
+
+Return exactly one JSON object with no prose or markdown, using this schema:
+{"has_fruit":true,"label":"تازه","freshness_score":95,"distribution":{"fresh":100,"middle":0,"rotten":0},"fruit_count_estimate":12,"confidence":90,"summary_fa":"توضیح کوتاه فارسی"}
+
+Rules:
+- freshness_score, confidence, and distribution values are integers from 0 to 100; distribution must total 100.
+- fruit_count_estimate is a non-negative integer estimate, or null when it cannot be estimated reliably.
+- summary_fa must be one concise Persian sentence grounded in visible evidence.
+- label must be exactly one of: "تازه", "تقریباً تازه", "متوسط", "تقریباً فاسد", "فاسد", "نامشخص".
+- If essentially all visible fruits are fresh, use "تازه". If most are fresh but a minority show aging or defects, use "تقریباً تازه". Use "متوسط" for a mixed or mid-quality lot, "تقریباً فاسد" when most show substantial deterioration, and "فاسد" when essentially all show clear decay.
+"""
+
+FRUIT_QUALITY_LABELS = {
+    "تازه",
+    "تقریباً تازه",
+    "متوسط",
+    "تقریباً فاسد",
+    "فاسد",
+    "نامشخص",
+}
+
 
 def _parse_yes_no_answers(raw_output: str) -> dict[str, str]:
     """Convert the private model response into the public two-answer contract."""
@@ -43,6 +67,73 @@ def _parse_yes_no_answers(raw_output: str) -> dict[str, str]:
         raise VideoInsightError("the video answers could not be determined")
 
     return {"fighting": normalize("fighting"), "floor_clean": normalize("floor_clean")}
+
+
+def _parse_fruit_quality(raw_output: str) -> dict[str, object]:
+    """Validate the model response before exposing it through the API."""
+
+    candidate = raw_output.strip()
+    json_object = re.search(r"\{.*\}", candidate, flags=re.DOTALL)
+    if json_object:
+        candidate = json_object.group(0)
+    try:
+        payload = json.loads(candidate)
+    except (TypeError, json.JSONDecodeError) as exc:
+        raise VideoInsightError("the fruit quality could not be determined") from exc
+    if not isinstance(payload, dict):
+        raise VideoInsightError("the fruit quality could not be determined")
+
+    has_fruit = payload.get("has_fruit")
+    label = payload.get("label")
+    summary = payload.get("summary_fa")
+    distribution = payload.get("distribution")
+    if not isinstance(has_fruit, bool) or label not in FRUIT_QUALITY_LABELS:
+        raise VideoInsightError("the fruit quality could not be determined")
+    if not isinstance(summary, str) or not summary.strip() or len(summary) > 500:
+        raise VideoInsightError("the fruit quality could not be determined")
+    if not isinstance(distribution, dict):
+        raise VideoInsightError("the fruit quality could not be determined")
+
+    def percentage(value: object) -> int:
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise VideoInsightError("the fruit quality could not be determined")
+        rounded = round(value)
+        if not 0 <= rounded <= 100:
+            raise VideoInsightError("the fruit quality could not be determined")
+        return rounded
+
+    freshness_score = percentage(payload.get("freshness_score"))
+    confidence = percentage(payload.get("confidence"))
+    normalized_distribution = {
+        key: percentage(distribution.get(key)) for key in ("fresh", "middle", "rotten")
+    }
+    if sum(normalized_distribution.values()) != 100:
+        raise VideoInsightError("the fruit quality percentages must total 100")
+    count = payload.get("fruit_count_estimate")
+    if count is not None and (isinstance(count, bool) or not isinstance(count, int) or count < 0):
+        raise VideoInsightError("the fruit quality could not be determined")
+    if not has_fruit:
+        label = "نامشخص"
+        count = None
+
+    return {
+        "has_fruit": has_fruit,
+        "label": label,
+        "freshness_score": freshness_score,
+        "distribution": normalized_distribution,
+        "fruit_count_estimate": count,
+        "confidence": confidence,
+        "summary_fa": summary.strip(),
+    }
+
+
+def extract_image_frame(image_path: str | Path) -> np.ndarray:
+    """Decode one still image as RGB for Qwen."""
+
+    frame = cv2.imread(str(image_path), cv2.IMREAD_COLOR)
+    if frame is None or not frame.size:
+        raise VideoInsightError("could not decode image")
+    return cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
 
 
 def extract_video_frames(
@@ -219,6 +310,29 @@ class VideoInsightService:
 
         return {
             "answers": _parse_yes_no_answers(raw_output),
+            "frame_count": len(frames),
+            "inference_seconds": round(inference_seconds, 3),
+        }
+
+    def interpret_fruit_quality(self, frames: list[np.ndarray]) -> dict[str, object]:
+        """Score the visible freshness of a fruit image or sampled video."""
+
+        if not frames:
+            raise VideoInsightError("at least one frame is required")
+        model, processor, torch = self._load()
+        with self._inference_lock, torch.inference_mode():
+            content = [{"type": "image", "image": frame} for frame in frames]
+            content.append({"type": "text", "text": FRUIT_QUALITY_PROMPT})
+            raw_output, inference_seconds = self._generate(
+                model,
+                processor,
+                torch,
+                [{"role": "user", "content": content}],
+                images=frames,
+                max_new_tokens=220,
+            )
+        return {
+            **_parse_fruit_quality(raw_output),
             "frame_count": len(frames),
             "inference_seconds": round(inference_seconds, 3),
         }

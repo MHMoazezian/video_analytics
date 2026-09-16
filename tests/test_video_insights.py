@@ -5,8 +5,10 @@ import numpy as np
 from contextlib import nullcontext
 
 from app.insights.service import (
+    FRUIT_QUALITY_PROMPT,
     VideoInsightError,
     VideoInsightService,
+    _parse_fruit_quality,
     _parse_yes_no_answers,
     extract_stream_frames,
     extract_video_frames,
@@ -128,3 +130,47 @@ def test_interpret_prompt_contains_both_fixed_questions(monkeypatch) -> None:
     visual_content = prompts[0][0]["content"]  # type: ignore[index]
     assert "Are there persons fighting in the video?" in visual_content[-1]["text"]
     assert "Is the floor of the scene clean?" in visual_content[-1]["text"]
+
+
+def test_parse_fruit_quality_returns_normalized_contract() -> None:
+    result = _parse_fruit_quality(
+        '```json\n{"has_fruit":true,"label":"تقریباً تازه",'
+        '"freshness_score":78,"distribution":{"fresh":75,"middle":20,"rotten":5},'
+        '"fruit_count_estimate":9,"confidence":84,"summary_fa":"بیشتر میوه‌ها تازه هستند."}\n```'
+    )
+
+    assert result["label"] == "تقریباً تازه"
+    assert result["distribution"] == {"fresh": 75, "middle": 20, "rotten": 5}
+    assert result["freshness_score"] == 78
+
+
+def test_parse_fruit_quality_rejects_invalid_distribution() -> None:
+    with np.testing.assert_raises(VideoInsightError):
+        _parse_fruit_quality(
+            '{"has_fruit":true,"label":"متوسط","freshness_score":50,'
+            '"distribution":{"fresh":40,"middle":40,"rotten":40},'
+            '"fruit_count_estimate":3,"confidence":70,"summary_fa":"کیفیت متوسط است."}'
+        )
+
+
+def test_interpret_fruit_quality_uses_common_prompt(monkeypatch) -> None:
+    service = VideoInsightService()
+    fake_torch = type("FakeTorch", (), {"inference_mode": staticmethod(nullcontext)})
+    monkeypatch.setattr(service, "_load", lambda: (object(), object(), fake_torch))
+    prompts: list[object] = []
+
+    def fake_generate(*args, **_kwargs):
+        prompts.append(args[3])
+        return (
+            '{"has_fruit":true,"label":"تازه","freshness_score":96,'
+            '"distribution":{"fresh":100,"middle":0,"rotten":0},'
+            '"fruit_count_estimate":4,"confidence":92,"summary_fa":"همه میوه‌ها تازه‌اند."}',
+            1.2,
+        )
+
+    monkeypatch.setattr(service, "_generate", fake_generate)
+    result = service.interpret_fruit_quality([np.zeros((4, 6, 3), dtype=np.uint8)])
+
+    assert result["label"] == "تازه"
+    assert result["frame_count"] == 1
+    assert prompts[0][0]["content"][-1]["text"] == FRUIT_QUALITY_PROMPT  # type: ignore[index]
