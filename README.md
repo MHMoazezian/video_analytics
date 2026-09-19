@@ -10,6 +10,19 @@ It also adds queue progress toward each configured service point. A FastAPI
 integration layer now exposes recorded-video upload jobs and their generated
 artifacts to the Tarebar dashboard.
 
+The event-driven video-insight API reuses the optimized Qwen2.5-VL flow from
+`Action_recognition/test_vlm_qwen_optimized_video.py`: eight uniformly sampled
+RGB frames, bounded processor resolution, 4-bit NF4 weights with FP16 compute
+on CUDA, and deterministic generation. `POST /api/v1/video-insights` accepts a
+recorded upload and video-time window; `POST /api/v1/video-insights/from-stream`
+samples a configurable live RTSP window. Both endpoints evaluate only whether
+people are fighting and whether the floor is clean. Generated model text stays
+inside the service and the public response contains normalized Yes/No answers.
+The model is loaded lazily from
+`VIDEO_INSIGHT_MODEL_PATH` and is deliberately not copied into the image.
+Production enables `VIDEO_INSIGHT_PRELOAD`, avoiding model-loading latency on
+the first dashboard query.
+
 ## Planned scope
 
 The MVP will process recorded video, webcams, and basic RTSP sources through one

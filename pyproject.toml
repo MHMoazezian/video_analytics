@@ -26,6 +26,15 @@ api = [
 dashboard = [
     "streamlit>=1.32,<2",
 ]
+video-insight = [
+    # torch is provided by the shared py3.11-torch2.5.1-cu118 image.
+    "accelerate==1.10.1",
+    "bitsandbytes==0.47.0",
+    "huggingface-hub==0.34.4",
+    "safetensors==0.6.2",
+    "tokenizers==0.21.4",
+    "transformers==4.55.4",
+]
 dev = [
     "pytest>=8,<9",
 ]

@@ -33,6 +33,7 @@ from app.geometry.config import load_camera_config
 from app.fleet.supervisor import fleet_supervisor
 from app.management.api import rollup_worker, router as management_router
 from app.management.repository import analytics_repository
+from app.insights import VideoInsightError, VideoInsightService
 from app.tracking.factory import available_tracker_types, public_tracker_catalog
 
 
@@ -48,12 +49,14 @@ SAVED_CAMERA_CONFIG_PATH = Path(
 )
 MAX_UPLOAD_BYTES = int(os.environ.get("VIDEO_ANALYTICS_MAX_UPLOAD_BYTES", 1_073_741_824))
 ALLOWED_VIDEO_SUFFIXES = frozenset({".mp4", ".mov", ".avi", ".mkv", ".webm", ".m4v"})
+ALLOWED_IMAGE_SUFFIXES = frozenset({".jpg", ".jpeg", ".png", ".webp", ".bmp"})
 manager = JobManager(
     JOBS_ROOT,
     max_workers=int(os.environ.get("VIDEO_ANALYTICS_JOB_WORKERS", "1")),
     processing_width=int(os.environ.get("VIDEO_ANALYTICS_PROCESSING_WIDTH", "1280")),
     frame_stride=int(os.environ.get("VIDEO_ANALYTICS_FRAME_STRIDE", "10")),
 )
+video_insight_service = VideoInsightService()
 
 app = FastAPI(title="Video Analytics MVP API", version="0.1.0")
 origins = [
@@ -78,6 +81,10 @@ async def start_analytics_store() -> None:
     analytics_repository.open()
     app.state.analytics_rollup_task = asyncio.create_task(rollup_worker())
     app.state.fleet_task = asyncio.create_task(asyncio.to_thread(fleet_supervisor.start))
+    if os.environ.get("VIDEO_INSIGHT_PRELOAD", "false").strip().lower() in {
+        "1", "true", "yes", "on"
+    }:
+        await asyncio.to_thread(video_insight_service.preload)
 
 
 @app.on_event("shutdown")
@@ -141,6 +148,24 @@ class StreamFrameRequest(BaseModel):
     def validate_stream_url(cls, value: str) -> str:
         return require_rtsp_url(value)
 
+
+class StreamVideoInsightRequest(BaseModel):
+    """Evaluate the two fixed questions over one live sampling window."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    stream_url: str = Field(min_length=1, max_length=2048)
+    num_frames: int = Field(default=8, ge=2, le=16)
+    interval_seconds: float = Field(default=10.0, ge=10.0, le=60.0)
+
+    @field_validator("stream_url")
+    @classmethod
+    def validate_stream_url(cls, value: str) -> str:
+        return require_rtsp_url(value)
+
+
+class StreamFruitQualityRequest(StreamVideoInsightRequest):
+    """Evaluate fruit freshness over one live sampling window."""
 
 @app.get("/health")
 def health() -> dict[str, object]:
@@ -318,6 +343,125 @@ def live_camera_preview(request: StreamFrameRequest) -> StreamingResponse:
         media_type="multipart/x-mixed-replace; boundary=frame",
         headers={"Cache-Control": "no-store", "X-Accel-Buffering": "no"},
     )
+
+
+@app.post("/api/v1/video-insights")
+async def interpret_recorded_video(
+    video: Annotated[UploadFile, File(...)],
+    num_frames: Annotated[int, Form(ge=2, le=16)] = 8,
+    window_start_seconds: Annotated[float, Form(ge=0)] = 0,
+    window_end_seconds: Annotated[float | None, Form(gt=0)] = None,
+) -> dict[str, object]:
+    """Evaluate the two fixed questions over a recorded-video time window."""
+
+    video_suffix = Path(video.filename or "").suffix.lower()
+    if video_suffix not in ALLOWED_VIDEO_SUFFIXES:
+        raise HTTPException(status_code=422, detail="unsupported recorded-video file type")
+    if window_end_seconds is not None and window_end_seconds <= window_start_seconds:
+        raise HTTPException(status_code=422, detail="window end must be after window start")
+    JOBS_ROOT.mkdir(parents=True, exist_ok=True)
+    try:
+        with tempfile.TemporaryDirectory(dir=JOBS_ROOT) as scratch_dir:
+            video_path = Path(scratch_dir) / f"input{video_suffix}"
+            await _save_upload(video, video_path, limit=MAX_UPLOAD_BYTES)
+            from app.insights.service import extract_video_frames
+
+            frames = await asyncio.to_thread(
+                extract_video_frames,
+                video_path,
+                num_frames=num_frames,
+                window_start_seconds=window_start_seconds,
+                window_end_seconds=window_end_seconds,
+            )
+            result = await asyncio.to_thread(
+                video_insight_service.interpret,
+                frames,
+            )
+    except VideoInsightError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    finally:
+        await video.close()
+    return {"data": result}
+
+
+@app.post("/api/v1/video-insights/from-stream")
+async def interpret_live_video(request: StreamVideoInsightRequest) -> dict[str, object]:
+    """Evaluate the two fixed questions over one live-camera time window."""
+
+    from app.insights.service import extract_stream_frames
+
+    try:
+        frames = await asyncio.to_thread(
+            extract_stream_frames,
+            request.stream_url,
+            num_frames=request.num_frames,
+            sample_interval_seconds=request.interval_seconds / (request.num_frames - 1),
+        )
+        result = await asyncio.to_thread(
+            video_insight_service.interpret,
+            frames,
+        )
+    except VideoInsightError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    return {"data": result}
+
+
+@app.post("/api/v1/fruit-quality")
+async def interpret_fruit_quality(
+    media: Annotated[UploadFile, File(...)],
+    num_frames: Annotated[int, Form(ge=1, le=16)] = 8,
+) -> dict[str, object]:
+    """Score visible fruit freshness in one image or a sampled video."""
+
+    suffix = Path(media.filename or "").suffix.lower()
+    if suffix not in ALLOWED_IMAGE_SUFFIXES | ALLOWED_VIDEO_SUFFIXES:
+        raise HTTPException(status_code=422, detail="unsupported fruit image or video type")
+    JOBS_ROOT.mkdir(parents=True, exist_ok=True)
+    try:
+        with tempfile.TemporaryDirectory(dir=JOBS_ROOT) as scratch_dir:
+            media_path = Path(scratch_dir) / f"input{suffix}"
+            await _save_upload(media, media_path, limit=MAX_UPLOAD_BYTES)
+            if suffix in ALLOWED_IMAGE_SUFFIXES:
+                from app.insights.service import extract_image_frame
+
+                frames = [await asyncio.to_thread(extract_image_frame, media_path)]
+            else:
+                from app.insights.service import extract_video_frames
+
+                frames = await asyncio.to_thread(
+                    extract_video_frames, media_path, num_frames=num_frames
+                )
+            result = await asyncio.to_thread(
+                video_insight_service.interpret_fruit_quality, frames
+            )
+    except VideoInsightError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    finally:
+        await media.close()
+    return {"data": result}
+
+
+@app.post("/api/v1/fruit-quality/from-stream")
+async def interpret_live_fruit_quality(
+    request: StreamFruitQualityRequest,
+) -> dict[str, object]:
+    """Score visible fruit freshness over one live-camera window."""
+
+    from app.insights.service import extract_stream_frames
+
+    try:
+        frames = await asyncio.to_thread(
+            extract_stream_frames,
+            request.stream_url,
+            num_frames=request.num_frames,
+            sample_interval_seconds=request.interval_seconds / (request.num_frames - 1),
+        )
+        result = await asyncio.to_thread(
+            video_insight_service.interpret_fruit_quality, frames
+        )
+    except VideoInsightError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    return {"data": result}
 
 
 @app.post("/api/v1/jobs", status_code=202)
