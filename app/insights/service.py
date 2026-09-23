@@ -26,7 +26,7 @@ class VideoInsightError(RuntimeError):
     """A user-facing video interpretation failure."""
 
 
-ANALYSIS_VERSION = 2
+ANALYSIS_VERSION = 3
 DETAIL_LEVELS = ("summary", "detailed")
 THUMBNAIL_MAX_WIDTH = 320
 THUMBNAIL_JPEG_QUALITY = 70
@@ -39,27 +39,26 @@ OUT_OF_MEMORY_MESSAGE = (
 FIGHT_QUESTION = "Are there persons fighting in the video?"
 FLOOR_CLEAN_QUESTION = "Is the floor of the scene clean?"
 
-FRUIT_QUALITY_PROMPT = """Evaluate the visible freshness of the fruits in these images. The images may be one photo or ordered samples from one video. Judge only visible fruit and summarize the whole scene; when video frames repeat the same fruits, do not treat each appearance as a different fruit.
+FRUIT_QUALITY_PROMPT = """Evaluate the visible freshness of the produce in these images. They come from a fixed camera in a wholesale fruit and vegetable market hall: several pallets, crates or boxes of produce are usually visible, and people may walk through the scene. Judge only the produce on the pallets, crates and boxes; ignore people, the floor, vehicles, packaging and anything that is not produce. The images may be one photo or ordered samples from one video; when frames show the same produce again, judge the lot once.
 
-Use visible evidence such as natural color, discoloration, bruising, mold, soft or collapsed areas, wrinkling, dryness, and decay. Do not claim anything about taste, smell, internal quality, or food safety that cannot be seen. Ignore non-fruit objects. If no fruit is clearly visible, set has_fruit to false and use the label "نامشخص".
+Use visible evidence such as bruising, mold, soft or collapsed areas, wrinkling, dryness, decay and uneven ripeness. Do not claim anything about taste, smell, internal quality or food safety that cannot be seen. If no produce is clearly visible, set has_fruit to false and use the label "نامشخص".
 
-Scoring guide for freshness_score (judge this image, never reuse a number from these instructions):
-- 90 to 100: firm, glossy, evenly coloured fruit with no visible defect.
+Scoring guide for freshness_score (judge this lot, never reuse a number from these instructions):
+- 90 to 100: firm, glossy, evenly ripe produce with no visible defect.
 - 70 to 89: fresh overall, with slight dullness or a few small blemishes.
-- 50 to 69: noticeable bruising, wrinkling, soft areas or discoloration on many fruits.
+- 50 to 69: noticeable bruising, wrinkling, soft areas or blemishes on much of the produce.
 - 25 to 49: widespread soft spots, mold or decay.
 - 0 to 24: almost everything is rotten.
 
 Return exactly one JSON object and nothing else: no prose, no markdown, no code fence. The object has exactly these keys:
 - "has_fruit": true or false.
-- "label": exactly one of "تازه", "تقریباً تازه", "متوسط", "تقریباً فاسد", "فاسد", "نامشخص". Use "تازه" when essentially all visible fruits are fresh, "تقریباً تازه" when most are fresh but a minority show aging or defects, "متوسط" for a mixed or mid-quality lot, "تقریباً فاسد" when most show substantial deterioration, and "فاسد" when essentially all show clear decay.
+- "label": exactly one of "تازه", "تقریباً تازه", "متوسط", "تقریباً فاسد", "فاسد", "نامشخص". Use "تازه" when essentially all visible produce is fresh, "تقریباً تازه" when most is fresh but a minority shows aging or defects, "متوسط" for a mixed or mid-quality lot, "تقریباً فاسد" when most shows substantial deterioration, and "فاسد" when essentially all shows clear decay.
 - "freshness_score": integer from 0 to 100 following the scoring guide.
-- "distribution": an object with the integer keys "fresh", "middle" and "rotten", the percentage of visible fruit in each state. The three values must total 100.
-- "fruit_count_estimate": integer count of the individual fruits you can see, or null when it cannot be estimated reliably.
-- "confidence": integer from 0 to 100, how sure you are given image sharpness, lighting and how much of the fruit is visible.
-- "summary_fa": one concise sentence written in Persian that names the fruit you see and the visible evidence behind your score.
+- "distribution": an object with the integer keys "fresh", "middle" and "rotten", the share of the visible produce in each state. The three values must total 100.
+- "confidence": integer from 0 to 100: how clearly the produce can be judged given distance, blur, lighting and how much of it people or packaging hide.
+- "summary_fa": one concise Persian sentence about the visible condition of the produce.
 
-Write every Persian text value as a real sentence about this image. Never copy wording from these instructions into a value.
+Rules for every Persian text value: describe the condition of the produce only. Never mention colours, never give numbers, counts or percentages, never mention people, and never copy wording from these instructions.
 """
 
 FRUIT_PRESENCE_PROMPT = (
@@ -81,7 +80,7 @@ FRUIT_QUALITY_LABELS = {
 FRUIT_DEFECT_LABELS_FA = {
     "bruising": "کوفتگی",
     "mold": "کپک‌زدگی",
-    "discoloration": "تغییر رنگ",
+    "discoloration": "لکه‌های پوستی",
     "soft_spot": "لکه نرم",
     "wrinkling": "چروکیدگی",
     "dryness": "خشکی",
@@ -91,46 +90,44 @@ FRUIT_DEFECT_LABELS_FA = {
     "other": "سایر",
 }
 FRUIT_DEFECT_SEVERITIES = ("low", "medium", "high")
+FRUIT_DEFECT_EXTENTS = ("few", "some", "most")
+FRUIT_DEFECT_EXTENT_LABELS_FA = {"few": "کم", "some": "بخشی از محصول", "most": "بیشتر محصول"}
 MAX_FRUIT_TYPES = 10
 MAX_FRUIT_DEFECTS = 12
 
-FRUIT_QUALITY_DETAILED_PROMPT = """Evaluate the visible freshness of the fruits in these images. The images may be one photo or ordered samples from one video. Judge only visible fruit and summarize the whole scene; when video frames repeat the same fruits, do not treat each appearance as a different fruit.
+FRUIT_QUALITY_DETAILED_PROMPT = """Evaluate the visible freshness of the produce in these images. They come from a fixed camera in a wholesale fruit and vegetable market hall: several pallets, crates or boxes of produce are usually visible, and people may walk through the scene. Judge only the produce on the pallets, crates and boxes; ignore people, the floor, vehicles, packaging and anything that is not produce. The images may be one photo or ordered samples from one video; when frames show the same produce again, judge the lot once.
 
-Use visible evidence such as natural color, discoloration, bruising, mold, soft or collapsed areas, wrinkling, dryness, and decay. Do not claim anything about taste, smell, internal quality, or food safety that cannot be seen. Ignore non-fruit objects. If no fruit is clearly visible, set has_fruit to false and use the label "نامشخص".
+Use visible evidence such as bruising, mold, soft or collapsed areas, wrinkling, dryness, decay and uneven ripeness. Do not claim anything about taste, smell, internal quality or food safety that cannot be seen. If no produce is clearly visible, set has_fruit to false and use the label "نامشخص".
 
-Scoring guide for freshness_score (judge this image, never reuse a number from these instructions):
-- 90 to 100: firm, glossy, evenly coloured fruit with no visible defect.
+Scoring guide for freshness_score (judge this lot, never reuse a number from these instructions):
+- 90 to 100: firm, glossy, evenly ripe produce with no visible defect.
 - 70 to 89: fresh overall, with slight dullness or a few small blemishes.
-- 50 to 69: noticeable bruising, wrinkling, soft areas or discoloration on many fruits.
+- 50 to 69: noticeable bruising, wrinkling, soft areas or blemishes on much of the produce.
 - 25 to 49: widespread soft spots, mold or decay.
 - 0 to 24: almost everything is rotten.
 
 Return exactly one JSON object and nothing else: no prose, no markdown, no code fence. The object has exactly these keys:
 - "has_fruit": true or false.
-- "label": exactly one of "تازه", "تقریباً تازه", "متوسط", "تقریباً فاسد", "فاسد", "نامشخص". Use "تازه" when essentially all visible fruits are fresh, "تقریباً تازه" when most are fresh but a minority show aging or defects, "متوسط" for a mixed or mid-quality lot, "تقریباً فاسد" when most show substantial deterioration, and "فاسد" when essentially all show clear decay.
+- "label": exactly one of "تازه", "تقریباً تازه", "متوسط", "تقریباً فاسد", "فاسد", "نامشخص". Use "تازه" when essentially all visible produce is fresh, "تقریباً تازه" when most is fresh but a minority shows aging or defects, "متوسط" for a mixed or mid-quality lot, "تقریباً فاسد" when most shows substantial deterioration, and "فاسد" when essentially all shows clear decay.
 - "freshness_score": integer from 0 to 100 following the scoring guide.
-- "distribution": an object with the integer keys "fresh", "middle" and "rotten", the percentage of visible fruit in each state. The three values must total 100.
-- "fruit_count_estimate": integer count of the individual fruits you can see, or null when it cannot be estimated reliably.
-- "confidence": integer from 0 to 100, how sure you are given image sharpness, lighting and how much of the fruit is visible.
-- "summary_fa": one concise sentence written in Persian that names the fruit you see and the visible evidence behind your score.
-- "fruit_types": a list with one object per visible kind of fruit, each with "name_fa" (the Persian name) and "share_percent" (integer share, 0 to 100, of the visible fruit).
-- "defects": a list with one object per defect that is actually visible, or an empty list when none is visible. Each object has "type" (exactly one of: bruising, mold, discoloration, soft_spot, wrinkling, dryness, decay, cut_damage, pest_damage, other), "severity" (exactly one of: low, medium, high), "affected_percent" (integer share, 0 to 100, of the visible fruit showing that defect) and "note_fa" (one short Persian phrase saying where or how it shows).
-- "shelf_life_days_estimate": integer estimate of the remaining days at room conditions judged only from the visible condition, or null when it cannot be estimated.
-- "recommendation_fa": one concise Persian sentence telling the seller what to do with this lot, for example sell it first, discount it, sort out the damaged fruit, or discard it.
-- "storage_advice_fa": one concise Persian sentence about how to store this lot.
+- "distribution": an object with the integer keys "fresh", "middle" and "rotten", the share of the visible produce in each state. The three values must total 100.
+- "confidence": integer from 0 to 100: how clearly the produce can be judged given distance, blur, lighting and how much of it people or packaging hide.
+- "summary_fa": one concise Persian sentence about the visible condition of the produce.
+- "fruit_types": a list of the Persian names of the kinds of produce you can clearly recognise, as plain strings, or an empty list.
+- "defects": a list with one object per defect that is actually visible, or an empty list when none is visible. Each object has "type" (exactly one of: bruising, mold, discoloration, soft_spot, wrinkling, dryness, decay, cut_damage, pest_damage, other), "severity" (exactly one of: low, medium, high), "extent" (exactly one of: few, some, most — how much of the visible produce shows it) and "note_fa" (one short Persian phrase saying where or how it shows).
 
-Write every Persian text value as a real sentence about this image. Never copy wording from these instructions into a value.
+Rules for every Persian text value: describe the condition of the produce only. Never mention colours, never give numbers, counts or percentages, never mention people, and never copy wording from these instructions.
 """
 
-FRUIT_FRAME_PROMPT = """Evaluate the visible freshness of the fruit in this single image. Judge only visible evidence such as color, bruising, mold, soft areas, wrinkling, dryness, and decay. Ignore non-fruit objects. If no fruit is clearly visible, set has_fruit to false and use the label "نامشخص".
+FRUIT_FRAME_PROMPT = """Evaluate the visible freshness of the produce in this single image from a fixed camera in a wholesale fruit and vegetable market hall. Judge only the produce on pallets, crates and boxes; ignore people, the floor, vehicles and packaging. Use only visible evidence such as bruising, mold, soft areas, wrinkling, dryness and decay. If no produce is clearly visible, set has_fruit to false and use the label "نامشخص".
 
-Scoring guide for freshness_score (judge this image, never reuse a number from these instructions): 90 to 100 no visible defect; 70 to 89 a few small blemishes; 50 to 69 noticeable bruising, wrinkling or discoloration; 25 to 49 widespread soft spots, mold or decay; 0 to 24 almost everything is rotten.
+Scoring guide for freshness_score (judge this image, never reuse a number from these instructions): 90 to 100 no visible defect; 70 to 89 a few small blemishes; 50 to 69 noticeable bruising, wrinkling or blemishes; 25 to 49 widespread soft spots, mold or decay; 0 to 24 almost everything is rotten.
 
 Return exactly one JSON object and nothing else: no prose, no markdown, no code fence. The object has exactly these keys:
 - "has_fruit": true or false.
 - "label": exactly one of "تازه", "تقریباً تازه", "متوسط", "تقریباً فاسد", "فاسد", "نامشخص".
 - "freshness_score": integer from 0 to 100 following the scoring guide.
-- "note_fa": one short Persian phrase naming the visible evidence. Never copy wording from these instructions.
+- "note_fa": one short Persian phrase naming the visible evidence, without colours, numbers or people. Never copy wording from these instructions.
 """
 
 
@@ -308,19 +305,17 @@ def _fruit_quality_core(payload: dict[str, object]) -> dict[str, object]:
         key: percentage(distribution.get(key)) for key in ("fresh", "middle", "rotten")
     }
     normalized_distribution = _balanced_distribution(normalized_distribution)
-    count = payload.get("fruit_count_estimate")
-    if count is not None and (isinstance(count, bool) or not isinstance(count, int) or count < 0):
-        raise VideoInsightError("the fruit quality could not be determined")
     if not has_fruit:
         label = "نامشخص"
-        count = None
 
     core: dict[str, object] = {
         "has_fruit": has_fruit,
         "label": label,
         "freshness_score": freshness_score,
         "distribution": normalized_distribution,
-        "fruit_count_estimate": count,
+        # A market scene holds several pallets and passing people; a count is
+        # neither reliable nor useful there, so it is never reported.
+        "fruit_count_estimate": None,
         "confidence": confidence,
     }
     # The numbers are the verdict; the sentence only illustrates them. When the
@@ -333,15 +328,30 @@ SUMMARY_MAX_CHARS = 500
 # First-person chatter ("I can describe this image in Persian ...") says nothing
 # about the fruit. No description of produce needs a first-person verb.
 _META_SENTENCE = re.compile(r"توانم|خواهم|زبان فارسی|هوش مصنوعی")
-_SENTENCE_SPLIT = re.compile(r"(?<=[.؟!۔])\s+")
+# Statements a market operator can dispute on the spot and that say nothing
+# about condition: colours, any number (counts, percentages, days) and people.
+_UNSAFE_SENTENCE = re.compile(
+    r"[0-9۰-۹]"
+    r"|تعداد|عدد|درصد"
+    r"|قرمز|سبز|زرد|نارنجی|قهوه[\u200c ]?ای|سیاه|سفید|بنفش|صورتی|آبی|طلایی|رنگ"
+    r"|نفر|افراد|مردم|آدم|مشتری|فروشنده|کارگر|انسان|شخص"
+)
+_SENTENCE_SPLIT = re.compile(r"(?<=[.؟!۔])\s+|\s*[;؛]\s*")
+
+
+def safe_model_text(value: str) -> str:
+    """Model text fit to show: cleaned, de-looped, and without colour, number or people statements."""
+
+    text = collapse_repetition(clean_model_text(value))
+    sentences = [part.strip() for part in _SENTENCE_SPLIT.split(text) if part.strip()]
+    kept = [part for part in sentences if not _META_SENTENCE.search(part) and not _UNSAFE_SENTENCE.search(part)]
+    return " ".join(kept)
 
 
 def _summary_text(summary: str) -> str:
-    """Readable text: no echoed prefix, chatter or repetition loop, bounded length."""
+    """Readable text: no echoed prefix, chatter, loop or disputable statement; bounded length."""
 
-    text = collapse_repetition(clean_model_text(summary))
-    sentences = [part for part in _SENTENCE_SPLIT.split(text) if part.strip()]
-    text = " ".join(part.strip() for part in sentences if not _META_SENTENCE.search(part))
+    text = safe_model_text(summary)
     if len(text) > SUMMARY_MAX_CHARS:
         text = text[: SUMMARY_MAX_CHARS - 1].rstrip() + "…"
     return text
@@ -351,8 +361,45 @@ FRUIT_GRADE_LABELS_FA = {"A": "درجه یک", "B": "درجه دو", "C": "در�
 _PERSIAN_DIGITS = str.maketrans("0123456789", "۰۱۲۳۴۵۶۷۸۹")
 
 
+def _fresh_sentence(fresh: int) -> str:
+    if fresh >= 85:
+        return "تقریباً همهٴ محصول قابل‌مشاهده تازه است"
+    if fresh >= 60:
+        return "بیشتر محصول قابل‌مشاهده تازه است"
+    if fresh >= 35:
+        return "بخشی از محصول تازه است"
+    if fresh >= 10:
+        return "بخش کوچکی از محصول تازه است"
+    return "محصول تازه به‌ندرت دیده می‌شود"
+
+
+def _aging_sentence(middle: int) -> str | None:
+    if middle == 0:
+        return None
+    if middle <= 15:
+        return "نشانه‌های کهنگی جزئی است"
+    if middle <= 40:
+        return "نشانه‌های کهنگی در بخشی از محصول دیده می‌شود"
+    return "نشانه‌های کهنگی گسترده است"
+
+
+def _spoilage_sentence(rotten: int) -> str:
+    if rotten == 0:
+        return "فساد قابل‌مشاهده‌ای دیده نمی‌شود"
+    if rotten <= 10:
+        return "فساد قابل‌مشاهده جزئی است"
+    if rotten <= 30:
+        return "فساد در بخشی از محصول دیده می‌شود"
+    return "فساد قابل‌مشاهده گسترده است"
+
+
 def fruit_verdict_fa(core: dict[str, object]) -> str:
-    """The verdict in words, composed from the validated numbers, never from model text."""
+    """The verdict in words, composed from the validated numbers, never from model text.
+
+    Shares are expressed as bands, not percentages: a small model's 60/30/10 is
+    a judgement, not a measurement, and a percentage invites a dispute the
+    operator cannot win in front of the pallet.
+    """
 
     if core.get("has_fruit") is not True:
         return NO_FRUIT_SUMMARY_FA
@@ -360,15 +407,16 @@ def fruit_verdict_fa(core: dict[str, object]) -> str:
     grade_label = FRUIT_GRADE_LABELS_FA.get(fruit_grade(score, True) or "", "")
     distribution = core["distribution"]
     assert isinstance(distribution, dict)
+    parts = [_fresh_sentence(int(distribution["fresh"]))]
+    aging = _aging_sentence(int(distribution["middle"]))
+    if aging:
+        parts.append(aging)
+    parts.append(_spoilage_sentence(int(distribution["rotten"])))
     text = (
-        f"کیفیت ظاهری «{core['label']}» ارزیابی شد: امتیاز تازگی {score} از 100"
-        f"{f' ({grade_label})' if grade_label else ''}. "
-        f"حدود {distribution['fresh']}٪ میوه‌ها تازه، {distribution['middle']}٪ متوسط"
-        f" و {distribution['rotten']}٪ فاسد به نظر می‌رسند."
+        f"کیفیت ظاهری محصول «{core['label']}» ارزیابی شد"
+        f"{f' ({grade_label}، امتیاز تازگی {score} از 100)' if grade_label else ''}. "
+        + "؛ ".join(parts) + "."
     )
-    count = core.get("fruit_count_estimate")
-    if isinstance(count, int) and count > 0:
-        text += f" تعداد تقریبی میوه‌های قابل مشاهده: {count}."
     return text.translate(_PERSIAN_DIGITS)
 
 
@@ -458,9 +506,10 @@ def clean_model_text(value: str) -> str:
 
 
 def _optional_text(value: object, limit: int = 500) -> str | None:
-    if not isinstance(value, str) or not clean_model_text(value):
+    if not isinstance(value, str):
         return None
-    return collapse_repetition(clean_model_text(value))[:limit]
+    text = safe_model_text(value)
+    return text[:limit] or None
 
 
 def empty_fruit_details() -> dict[str, object]:
@@ -479,8 +528,10 @@ def empty_fruit_details() -> dict[str, object]:
 def _fruit_name(value: object) -> str | None:
     """A fruit name is a short noun phrase; a whole sentence in its place is dropped."""
 
-    name = _optional_text(value, 100)
-    if name is None or len(name) > 30 or len(name.split()) > 3:
+    # Variety names such as "سیب زرد" carry a colour word legitimately, so the
+    # disputable-sentence filter does not apply to names.
+    name = collapse_repetition(clean_model_text(value)).strip()[:100] if isinstance(value, str) else ""
+    if not name or len(name) > 30 or len(name.split()) > 3:
         return None
     if any(mark in name for mark in SENTENCE_MARKS + "،:"):
         return None
@@ -502,6 +553,18 @@ def fruit_action_fa(core: dict[str, object]) -> str | None:
     return FRUIT_ACTIONS_FA.get(grade) if grade else None
 
 
+def _defect_extent(item: dict[str, object]) -> str | None:
+    """few | some | most from the model's extent, or from a legacy percentage."""
+
+    raw = item.get("extent")
+    if isinstance(raw, str) and raw.strip().lower() in FRUIT_DEFECT_EXTENTS:
+        return raw.strip().lower()
+    share = _optional_percentage(item.get("affected_percent"))
+    if share is None:
+        return None
+    return "few" if share <= 15 else "some" if share <= 50 else "most"
+
+
 def _parse_fruit_details(payload: dict[str, object]) -> dict[str, object]:
     """Lenient contract for the optional fields: bad entries are dropped, never raised."""
 
@@ -509,17 +572,11 @@ def _parse_fruit_details(payload: dict[str, object]) -> dict[str, object]:
     fruit_types: list[dict[str, object]] = []
     raw_types = payload.get("fruit_types")
     for item in raw_types if isinstance(raw_types, list) else ():
-        if not isinstance(item, dict):
+        # Names only: a share per kind is a number nobody can check on a pallet.
+        name = _fruit_name(item.get("name_fa") if isinstance(item, dict) else item)
+        if name is None or any(entry["name_fa"] == name for entry in fruit_types):
             continue
-        name = _fruit_name(item.get("name_fa"))
-        share = _optional_percentage(item.get("share_percent"))
-        if name is None or share is None:
-            continue
-        existing = next((entry for entry in fruit_types if entry["name_fa"] == name), None)
-        if existing is not None:
-            existing["share_percent"] = min(100, int(existing["share_percent"]) + share)
-        else:
-            fruit_types.append({"name_fa": name, "share_percent": share})
+        fruit_types.append({"name_fa": name, "share_percent": None})
     details["fruit_types"] = fruit_types[:MAX_FRUIT_TYPES]
 
     defects: list[dict[str, object]] = []
@@ -529,8 +586,7 @@ def _parse_fruit_details(payload: dict[str, object]) -> dict[str, object]:
             continue
         raw_type = item.get("type")
         raw_severity = item.get("severity")
-        affected = _optional_percentage(item.get("affected_percent"))
-        if not isinstance(raw_type, str) or not raw_type.strip() or affected is None:
+        if not isinstance(raw_type, str) or not raw_type.strip():
             continue
         if not isinstance(raw_severity, str) or raw_severity.strip().lower() not in FRUIT_DEFECT_SEVERITIES:
             continue
@@ -538,26 +594,129 @@ def _parse_fruit_details(payload: dict[str, object]) -> dict[str, object]:
         if defect_type not in FRUIT_DEFECT_LABELS_FA:
             # A real but unlisted defect is still worth reporting under "other".
             defect_type = "other"
+        extent = _defect_extent(item)
         defects.append({
             "type": defect_type,
             "label_fa": FRUIT_DEFECT_LABELS_FA[defect_type],
             "severity": raw_severity.strip().lower(),
-            "affected_percent": affected,
+            "extent": extent,
+            "extent_label_fa": FRUIT_DEFECT_EXTENT_LABELS_FA.get(extent or "", None),
+            "affected_percent": None,
             "note_fa": _optional_text(item.get("note_fa"), 300) or "",
         })
     details["defects"] = defects[:MAX_FRUIT_DEFECTS]
 
-    shelf_life = payload.get("shelf_life_days_estimate")
-    if (
-        isinstance(shelf_life, (int, float))
-        and not isinstance(shelf_life, bool)
-        and shelf_life == shelf_life
-        and 0 <= shelf_life <= 365
-    ):
-        details["shelf_life_days_estimate"] = round(shelf_life)
+    # Shelf life in days is not asked for any more: it is a guess in a number's
+    # clothing. The grade-based recommendation carries the decision instead.
+    details["shelf_life_days_estimate"] = None
     details["model_recommendation_fa"] = _optional_text(payload.get("recommendation_fa"))
     details["storage_advice_fa"] = _optional_text(payload.get("storage_advice_fa"))
     return details
+
+
+_SEVERITY_RANK = {"low": 1, "medium": 2, "high": 3}
+_LEVELS_FA = {0: ("دیده نمی‌شود", "good"), 1: ("کم", "good"), 2: ("متوسط", "watch"), 3: ("زیاد", "poor")}
+_SPOILAGE_TYPES = ("mold", "decay")
+_MECHANICAL_TYPES = ("bruising", "cut_damage", "soft_spot", "pest_damage")
+_SURFACE_TYPES = ("wrinkling", "dryness", "discoloration")
+
+
+_SEVERITY_LABELS_FA = {"low": "کم", "medium": "متوسط", "high": "زیاد"}
+
+
+def _defect_level(defects: Sequence[dict[str, object]], types: Sequence[str]) -> tuple[int, str | None]:
+    """0..3 for a group of defect types, plus a note naming the defects found.
+
+    The note is composed from the parsed type, severity and extent, never from
+    the model's free text (which named a "portal" on a pallet in testing).
+    """
+
+    level = 0
+    notes: list[str] = []
+    for defect in defects:
+        if defect.get("type") not in types:
+            continue
+        rank = _SEVERITY_RANK.get(str(defect.get("severity")), 1)
+        if defect.get("extent") == "most":
+            rank = min(3, rank + 1)
+        level = max(level, rank)
+        extent_label = defect.get("extent_label_fa")
+        note = f"{defect.get('label_fa')} ({_SEVERITY_LABELS_FA.get(str(defect.get('severity')), '')}"
+        note += f"، {extent_label})" if extent_label else ")"
+        if note not in notes:
+            notes.append(note)
+    return level, ("؛ ".join(notes)[:200] or None)
+
+
+def _aspect(key: str, label_fa: str, value_fa: str, status: str, note_fa: str | None = None) -> dict[str, object]:
+    return {"key": key, "label_fa": label_fa, "value_fa": value_fa, "status": status, "note_fa": note_fa}
+
+
+def fruit_quality_profile(
+    core: dict[str, object], details: dict[str, object], *, detailed: bool
+) -> list[dict[str, object]]:
+    """Condition of the lot as a few observable aspects, each a band with evidence.
+
+    Composed from the validated numbers and the parsed defects, never from free
+    text, so it is consistent with the score and carries no count, colour or
+    percentage a bystander could dispute.
+    """
+
+    if core.get("has_fruit") is not True:
+        return []
+    score = int(core["freshness_score"])
+    grade = fruit_grade(score, True) or "D"
+    distribution = core["distribution"]
+    assert isinstance(distribution, dict)
+    fresh, middle, rotten = (int(distribution[key]) for key in ("fresh", "middle", "rotten"))
+    defects = [d for d in details.get("defects", []) if isinstance(d, dict)]
+
+    profile = [
+        _aspect(
+            "overall", "تازگی کلی", f"{FRUIT_GRADE_LABELS_FA[grade]} ({core['label']})",
+            "good" if grade == "A" else "watch" if grade == "B" else "poor",
+        )
+    ]
+
+    dominant = max(fresh, middle, rotten)
+    if dominant >= 85:
+        profile.append(_aspect("uniformity", "یکدستی بار", "یکدست", "good"))
+    elif dominant >= 60:
+        profile.append(_aspect("uniformity", "یکدستی بار", "نسبتاً یکدست", "watch",
+                               "بخشی از محصول با کیفیت متفاوت در کنار بار اصلی دیده می‌شود."))
+    else:
+        profile.append(_aspect("uniformity", "یکدستی بار", "ناهمگن", "poor",
+                               "کیفیت‌های متفاوت در کنار هم؛ سورت‌کردن پیش از عرضه توصیه می‌شود."))
+
+    spoilage_level, spoilage_note = _defect_level(defects, _SPOILAGE_TYPES)
+    if rotten <= 5 and spoilage_level <= 1:
+        profile.append(_aspect("spoilage", "نشانه‌های فساد (کپک، پوسیدگی)", "دیده نمی‌شود یا بسیار کم", "good", spoilage_note))
+    elif rotten <= 20 and spoilage_level <= 2:
+        profile.append(_aspect("spoilage", "نشانه‌های فساد (کپک، پوسیدگی)", "محدود", "watch", spoilage_note))
+    elif rotten <= 50:
+        profile.append(_aspect("spoilage", "نشانه‌های فساد (کپک، پوسیدگی)", "قابل توجه", "poor", spoilage_note))
+    else:
+        profile.append(_aspect("spoilage", "نشانه‌های فساد (کپک، پوسیدگی)", "گسترده", "poor", spoilage_note))
+
+    if detailed:
+        for key, label, types in (
+            ("mechanical", "آسیب مکانیکی (کوفتگی، بریدگی، نرم‌شدگی)", _MECHANICAL_TYPES),
+            ("surface", "پوست و سطح (چروک، خشکی، لکه)", _SURFACE_TYPES),
+        ):
+            level, note = _defect_level(defects, types)
+            value_fa, status = _LEVELS_FA[level]
+            profile.append(_aspect(key, label, value_fa, status, note))
+
+    confidence = int(core["confidence"])
+    if confidence >= 80:
+        profile.append(_aspect("coverage", "پوشش ارزیابی", "خوب", "good", "محصول در فریم‌های بررسی‌شده به‌وضوح دیده می‌شود."))
+    elif confidence >= 60:
+        profile.append(_aspect("coverage", "پوشش ارزیابی", "متوسط", "watch",
+                               "بخشی از محصول به‌وضوح دیده نمی‌شود (فاصله، نور یا مانع در دید)."))
+    else:
+        profile.append(_aspect("coverage", "پوشش ارزیابی", "محدود", "poor",
+                               "دید محدود به محصول؛ نتیجه با احتیاط تفسیر شود و در صورت امکان تصویر نزدیک‌تر تهیه شود."))
+    return profile
 
 
 def _parse_fruit_frame(raw_output: str) -> dict[str, object]:
@@ -1127,6 +1286,7 @@ class VideoInsightService:
             "grade": fruit_grade(core["freshness_score"], core["has_fruit"]),
             **details,
             "recommendation_fa": fruit_action_fa(core),
+            "quality_profile": fruit_quality_profile(core, details, detailed=detail_level == "detailed"),
             "frames": frame_results,
             "frame_statistics": frame_statistics(frame_results),
             "total_seconds": round(time.perf_counter() - started, 3),

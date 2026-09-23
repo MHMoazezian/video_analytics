@@ -31,12 +31,15 @@ from app.insights.service import (
     resolve_precision,
     _repair_truncated_json,
     collapse_repetition,
+    empty_fruit_details,
     encode_thumbnail,
     extract_stream_frames,
     extract_video_frames,
     frame_statistics,
     fruit_grade,
     fruit_verdict_fa,
+    fruit_quality_profile,
+    safe_model_text,
     sample_stream_frames,
     sample_video_frames,
 )
@@ -256,15 +259,23 @@ def _frames(count: int) -> list[np.ndarray]:
 def test_lenient_detail_parser_drops_bad_optional_entries() -> None:
     details = _parse_fruit_details(DETAILED_ANSWER)
 
-    assert details["fruit_types"] == [{"name_fa": "سیب", "share_percent": 70}]
-    assert details["defects"] == [
-        {"type": "bruising", "label_fa": "کوفتگی", "severity": "low",
-         "affected_percent": 10, "note_fa": "کوفتگی جزئی"},
-        # An unlisted but well-formed defect is kept under "other".
-        {"type": "other", "label_fa": "سایر", "severity": "medium",
-         "affected_percent": 5, "note_fa": ""},
+    # Names only (a string entry is accepted too); shares are never reported.
+    assert details["fruit_types"] == [
+        {"name_fa": "سیب", "share_percent": None},
+        {"name_fa": "موز", "share_percent": None},
+        {"name_fa": "پرتقال", "share_percent": None},
     ]
-    assert details["shelf_life_days_estimate"] == 5
+    assert details["defects"] == [
+        {"type": "bruising", "label_fa": "کوفتگی", "severity": "low", "extent": "few",
+         "extent_label_fa": "کم", "affected_percent": None, "note_fa": "کوفتگی جزئی"},
+        # An unlisted but well-formed defect is kept under "other".
+        {"type": "other", "label_fa": "سایر", "severity": "medium", "extent": "few",
+         "extent_label_fa": "کم", "affected_percent": None, "note_fa": ""},
+        # An unreadable extent leaves the band empty but keeps the defect.
+        {"type": "decay", "label_fa": "پوسیدگی", "severity": "high", "extent": None,
+         "extent_label_fa": None, "affected_percent": None, "note_fa": "x"},
+    ]
+    assert details["shelf_life_days_estimate"] is None  # never estimated any more
     # The model's advice is kept for the record only; the shown one follows the grade.
     assert details["model_recommendation_fa"] == "ابتدا این محموله فروخته شود."
     assert details["recommendation_fa"] is None
@@ -312,11 +323,16 @@ def test_summary_response_carries_every_new_field_with_empty_defaults(monkeypatc
 
     result = service.interpret_fruit_quality(_frames(3))
 
-    assert {key: result[key] for key in CORE_ANSWER} == CORE_ANSWER
+    assert {key: result[key] for key in CORE_ANSWER if key != "fruit_count_estimate"} == {
+        key: value for key, value in CORE_ANSWER.items() if key != "fruit_count_estimate"
+    }
     assert result["frame_count"] == 3
     assert result["inference_seconds"] == 1.5
-    assert result["analysis_version"] == 2
+    assert result["analysis_version"] == 3
     assert result["detail_level"] == "summary"
+    assert result["fruit_count_estimate"] is None
+    # Summary answers still get the profile aspects that need no defect list.
+    assert [aspect["key"] for aspect in result["quality_profile"]] == ["overall", "uniformity", "spoilage", "coverage"]
     assert result["model"] == "Qwen2.5-VL-3B-Instruct"
     assert result["grade"] == "B"
     # Detail fields are only filled for detail_level="detailed".
@@ -347,9 +363,12 @@ def test_detailed_response_uses_the_detailed_prompt_and_server_side_grade(monkey
     assert calls == [(FRUIT_QUALITY_DETAILED_PROMPT, 700)]
     assert result["detail_level"] == "detailed"
     assert result["grade"] == "B"  # 78 -> B, although the model claimed "A"
-    assert result["fruit_types"] == [{"name_fa": "سیب", "share_percent": 70}]
-    assert [item["type"] for item in result["defects"]] == ["bruising", "other"]
-    assert result["shelf_life_days_estimate"] == 5
+    assert [item["name_fa"] for item in result["fruit_types"]] == ["سیب", "موز", "پرتقال"]
+    assert [item["type"] for item in result["defects"]] == ["bruising", "other", "decay"]
+    assert result["shelf_life_days_estimate"] is None
+    assert [aspect["key"] for aspect in result["quality_profile"]] == [
+        "overall", "uniformity", "spoilage", "mechanical", "surface", "coverage",
+    ]
 
 
 def test_detailed_request_falls_back_to_the_summary_prompt_when_the_answer_is_unusable(monkeypatch) -> None:
@@ -920,18 +939,18 @@ def test_distribution_close_to_one_hundred_is_rebalanced() -> None:
     assert result["distribution"]["fresh"] > result["distribution"]["middle"] > result["distribution"]["rotten"]
 
 
-def test_repeated_fruit_names_are_merged() -> None:
+def test_repeated_fruit_names_are_listed_once_without_shares() -> None:
     from app.insights.service import _parse_fruit_details
 
     details = _parse_fruit_details({"fruit_types": [
         {"name_fa": "پرتقال", "share_percent": 50},
-        {"name_fa": "لیمو", "share_percent": 20},
+        "لیمو",
         {"name_fa": "پرتقال", "share_percent": 20},
     ]})
 
     assert details["fruit_types"] == [
-        {"name_fa": "پرتقال", "share_percent": 70},
-        {"name_fa": "لیمو", "share_percent": 20},
+        {"name_fa": "پرتقال", "share_percent": None},
+        {"name_fa": "لیمو", "share_percent": None},
     ]
 
 
@@ -995,7 +1014,7 @@ def test_answer_cut_off_inside_a_repetition_loop_is_recovered() -> None:
 
     assert result["freshness_score"] == 75
     assert result["distribution"] == {"fresh": 60, "middle": 30, "rotten": 10}
-    assert result["fruit_count_estimate"] == 6
+    assert result["fruit_count_estimate"] is None  # a count is never reported
     # The loop is dropped; the complete sentence in front of it is kept.
     assert result["summary_fa"] == "چند سیب و پرتقال روی میز دیده می‌شود."
 
@@ -1043,11 +1062,11 @@ def test_overlong_summary_is_shortened_instead_of_rejected() -> None:
 
 def test_cut_off_text_ends_at_the_last_complete_sentence() -> None:
     cut = json.dumps({**CORE_ANSWER, "summary_fa": "X"}, ensure_ascii=False).replace(
-        '"X"}', '"سیب‌ها چروکیده و قهوه‌ای شده‌اند. روی پوست لکه‌های نرم دیده می‌شود و بدون دیدن'
+        '"X"}', '"سیب‌ها چروکیده و نرم شده‌اند. روی پوست لکه‌های نرم دیده می‌شود و بدون دیدن'
     )
     result = _parse_fruit_quality(cut)
 
-    assert result["summary_fa"] == "سیب‌ها چروکیده و قهوه‌ای شده‌اند."
+    assert result["summary_fa"] == "سیب‌ها چروکیده و نرم شده‌اند."
 
 
 def test_first_person_chatter_is_not_shown_as_the_summary() -> None:
@@ -1064,10 +1083,11 @@ def test_first_person_chatter_is_not_shown_as_the_summary() -> None:
 def test_verdict_is_composed_from_the_validated_numbers(monkeypatch) -> None:
     verdict = fruit_verdict_fa(CORE_ANSWER)
 
+    # Bands instead of percentages, and no count: nothing a bystander can dispute.
     assert verdict == (
-        "کیفیت ظاهری «تقریباً تازه» ارزیابی شد: امتیاز تازگی ۷۸ از ۱۰۰ (درجه دو). "
-        "حدود ۷۵٪ میوه‌ها تازه، ۲۰٪ متوسط و ۵٪ فاسد به نظر می‌رسند. "
-        "تعداد تقریبی میوه‌های قابل مشاهده: ۹."
+        "کیفیت ظاهری محصول «تقریباً تازه» ارزیابی شد (درجه دو، امتیاز تازگی ۷۸ از ۱۰۰). "
+        "بیشتر محصول قابل‌مشاهده تازه است؛ نشانه‌های کهنگی در بخشی از محصول دیده می‌شود؛ "
+        "فساد قابل‌مشاهده جزئی است."
     )
     assert fruit_verdict_fa({**CORE_ANSWER, "has_fruit": False}) == NO_FRUIT_SUMMARY_FA
 
@@ -1100,7 +1120,7 @@ def test_a_sentence_in_place_of_a_fruit_name_is_dropped() -> None:
         ]
     })
 
-    assert details["fruit_types"] == [{"name_fa": "سیب زرد", "share_percent": 60}]
+    assert details["fruit_types"] == [{"name_fa": "سیب زرد", "share_percent": None}]
 
 
 # --- model precision and image resolution follow the GPU ---------------------
@@ -1246,3 +1266,67 @@ def test_small_gpu_keeps_todays_four_bit_profile(monkeypatch, tmp_path) -> None:
     assert recorded["model"]["torch_dtype"] == "fp16-dtype"
     assert (recorded["processor"]["min_pixels"], recorded["processor"]["max_pixels"]) == (256 * 256, 512 * 512)
     assert service.describe()["precision"] == "4bit"
+
+
+# --- nothing a bystander can dispute: no colours, numbers, people or counts ----
+
+
+def test_disputable_statements_are_removed_from_model_text() -> None:
+    text = (
+        "سیب‌ها سفت و براق هستند. رنگ آن‌ها قرمز روشن است. "
+        "حدود ۱۲ میوه دیده می‌شود. دو نفر از کنار پالت رد می‌شوند؛ چند میوه کوفتگی دارند."
+    )
+    assert safe_model_text(text) == "سیب‌ها سفت و براق هستند. چند میوه کوفتگی دارند."
+    # Nothing left → the caller falls back to the server-composed verdict.
+    result = _parse_fruit_quality(json.dumps({**CORE_ANSWER, "summary_fa": "میوه‌ها زرد و نارنجی هستند و 8 عدد هستند."}))
+    assert result["summary_fa"] == fruit_verdict_fa(result)
+
+
+def test_prompts_ask_for_no_counts_shares_or_shelf_life() -> None:
+    for prompt in (FRUIT_QUALITY_PROMPT, FRUIT_QUALITY_DETAILED_PROMPT, FRUIT_FRAME_PROMPT):
+        assert "fruit_count_estimate" not in prompt
+        assert "share_percent" not in prompt
+        assert "shelf_life" not in prompt
+        assert "storage_advice" not in prompt
+        assert "market hall" in prompt and "ignore people" in prompt
+        assert "Never mention colours" in prompt or "without colours" in prompt
+
+
+def test_a_count_sent_by_the_model_is_dropped() -> None:
+    result = _parse_fruit_quality(json.dumps({**CORE_ANSWER, "fruit_count_estimate": 12}))
+    assert result["fruit_count_estimate"] is None
+
+
+def test_defect_extent_is_a_band() -> None:
+    details = _parse_fruit_details({"defects": [
+        {"type": "bruising", "severity": "low", "extent": "MOST"},
+        {"type": "bruising", "severity": "low", "affected_percent": 10},
+        {"type": "bruising", "severity": "low", "affected_percent": 40},
+        {"type": "bruising", "severity": "low", "affected_percent": 80},
+        {"type": "bruising", "severity": "low", "extent": "half"},
+    ]})
+    assert [item["extent"] for item in details["defects"]] == ["most", "few", "some", "most", None]
+    assert details["defects"][0]["extent_label_fa"] == "بیشتر محصول"
+
+
+def test_quality_profile_follows_the_numbers_and_the_defects() -> None:
+    details = _parse_fruit_details(DETAILED_ANSWER)
+    profile = {aspect["key"]: aspect for aspect in fruit_quality_profile(CORE_ANSWER, details, detailed=True)}
+
+    assert profile["overall"]["value_fa"] == "درجه دو (تقریباً تازه)" and profile["overall"]["status"] == "watch"
+    assert profile["uniformity"]["value_fa"] == "نسبتاً یکدست"          # dominant share 75
+    assert profile["spoilage"]["status"] == "poor"                        # decay, high severity
+    # The note names the parsed defects, never the model's free text.
+    assert profile["mechanical"]["value_fa"] == "کم" and profile["mechanical"]["note_fa"] == "کوفتگی (کم، کم)"
+    assert profile["spoilage"]["note_fa"] == "پوسیدگی (زیاد)"
+    assert profile["surface"]["value_fa"] == "دیده نمی‌شود"
+    assert profile["coverage"]["value_fa"] == "خوب"                       # confidence 84
+
+    rotten_lot = {**CORE_ANSWER, "freshness_score": 20, "label": "فاسد",
+                  "distribution": {"fresh": 0, "middle": 0, "rotten": 100}, "confidence": 55}
+    summary = {aspect["key"]: aspect for aspect in fruit_quality_profile(rotten_lot, empty_fruit_details(), detailed=False)}
+    assert list(summary) == ["overall", "uniformity", "spoilage", "coverage"]
+    assert summary["uniformity"]["value_fa"] == "یکدست"
+    assert summary["spoilage"]["value_fa"] == "گسترده"
+    assert summary["coverage"]["value_fa"] == "محدود"
+    assert fruit_quality_profile({**CORE_ANSWER, "has_fruit": False}, empty_fruit_details(), detailed=True) == []

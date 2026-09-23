@@ -428,6 +428,21 @@ exactly the original verdict plus the new, empty fields.
 - The core fields are validated strictly (a violation is HTTP 503). `grade` is
   derived by the service from `freshness_score` (≥85 A, ≥70 B, ≥50 C, else D;
   `null` without fruit) and never taken from the model.
+- **Demo-safe output (analysis version 3).** The scene is a market hall with
+  several pallets and passing people, so the prompts describe that scene and
+  ask the model to ignore people, floor and packaging. Nothing a bystander can
+  dispute is asked for or shown: no fruit count (`fruit_count_estimate` is
+  always `null`), no shares per fruit kind, no shelf-life days, no storage
+  advice, and Persian text sentences that mention colours, numbers or people
+  are dropped. Instead the service composes `quality_profile`, a list of
+  observable aspects derived from the validated numbers and parsed defects —
+  `overall` (grade), `uniformity` (dominant share), `spoilage` (rotten share +
+  mold/decay), `mechanical` and `surface` (detailed only, from the defect
+  groups), `coverage` (confidence) — each `{key, label_fa, value_fa, status:
+  good|watch|poor, note_fa}`. Defects carry `extent` (`few|some|most`) and
+  `extent_label_fa` instead of a percentage; `verdict_fa` uses bands, not
+  percentages. `fruit_types` (names only), `summary_fa` and `defects[].note_fa`
+  remain in the response for the record but the dashboard does not display them.
 - The analysis starts with a one-word presence question (is any fruit or
   vegetable visible?) on at most three evenly spaced frames. Only a clear "No"
   ends it there with the no-fruit result (`has_fruit: false`, label `نامشخص`,
