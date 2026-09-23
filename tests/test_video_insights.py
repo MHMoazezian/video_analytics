@@ -1161,7 +1161,7 @@ def test_pixel_budget_keeps_a_camera_frame_at_full_resolution_on_a_large_gpu() -
     small = resolve_pixel_budget(None, None, total_bytes=4 * GIB)
     large = resolve_pixel_budget(None, None, total_bytes=24 * GIB)
 
-    assert small == (256 * 256, 512 * 512)
+    assert small == (256 * 256, 384 * 384)
     assert large == (256 * 28 * 28, 1280 * 28 * 28)
     assert large[1] >= 1280 * 720  # a 720p frame is not downscaled
     # Explicit settings always win, and the minimum never exceeds the maximum.
@@ -1226,7 +1226,7 @@ def _fake_model_stack(monkeypatch, tmp_path, *, free_gib: float, total_gib: floa
 
     transformers = types.SimpleNamespace(
         AutoProcessor=_Processor,
-        Qwen2_5_VLForConditionalGeneration=_Model,
+        AutoModelForImageTextToText=_Model,
         BitsAndBytesConfig=lambda **options: {"bitsandbytes": options},
     )
     monkeypatch.setitem(sys.modules, "torch", torch)
@@ -1264,7 +1264,7 @@ def test_small_gpu_keeps_todays_four_bit_profile(monkeypatch, tmp_path) -> None:
         }
     }
     assert recorded["model"]["torch_dtype"] == "fp16-dtype"
-    assert (recorded["processor"]["min_pixels"], recorded["processor"]["max_pixels"]) == (256 * 256, 512 * 512)
+    assert (recorded["processor"]["min_pixels"], recorded["processor"]["max_pixels"]) == (256 * 256, 384 * 384)
     assert service.describe()["precision"] == "4bit"
 
 

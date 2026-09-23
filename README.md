@@ -10,12 +10,12 @@ It also adds queue progress toward each configured service point. A FastAPI
 integration layer now exposes recorded-video upload jobs and their generated
 artifacts to the Tarebar dashboard.
 
-The event-driven video-insight API reuses the optimized Qwen2.5-VL flow from
+The event-driven video-insight API uses a 4-bit Qwen3-VL-2B flow derived from
 `Action_recognition/test_vlm_qwen_optimized_video.py`: eight uniformly sampled
 RGB frames, bounded processor resolution, and deterministic generation. Precision
 and resolution follow the GPU (`VIDEO_INSIGHT_PRECISION=auto`): unquantized
 bf16/fp16 weights and full-resolution frames when the card can hold them, 4-bit
-NF4 weights and ~512x512 frames only on a small one; see "Model quality" below. `POST /api/v1/video-insights` accepts a
+NF4 weights and ~384x384 frames only on a small one; see "Model quality" below. `POST /api/v1/video-insights` accepts a
 recorded upload and video-time window; `POST /api/v1/video-insights/from-stream`
 samples a configurable live RTSP window. Both endpoints evaluate only whether
 people are fighting and whether the floor is clean. Generated model text stays
@@ -330,11 +330,12 @@ The insight model is never weakened when the hardware can afford it.
 - `VIDEO_INSIGHT_MIN_PIXELS` / `VIDEO_INSIGHT_MAX_PIXELS` bound what the model
   sees per frame. Unset, they follow the GPU: from 12 GiB of VRAM on
   `200704`-`1003520` (256-1280 patches of 28x28, the range of the model card; a
-  1280x720 camera frame is not downscaled), below that `65536`-`262144`. Small
+  1280x720 camera frame is not downscaled), below that `65536`-`147456`. Small
   defects such as bruises and mould spots depend on this more than on anything
   else.
-- A larger checkpoint only needs `VIDEO_INSIGHT_MODEL_PATH` (any
-  `Qwen2.5-VL-*-Instruct` directory).
+- Another checkpoint only needs `VIDEO_INSIGHT_MODEL_PATH`: any `Qwen3-VL-*-Instruct`
+  or `Qwen2.5-VL-*-Instruct` directory (the loader dispatches on the config). The
+  default is `Qwen3-VL-2B-Instruct`, which needs transformers >= 4.57 (in the image).
 - `GET /health` reports what is in effect: `"insights": {"model", "loaded",
   "requested_precision", "precision", "min_pixels", "max_pixels"}`; the same
   line is logged when the model loads.

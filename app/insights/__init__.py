@@ -1,4 +1,4 @@
-"""Query-driven video interpretation with Qwen2.5-VL."""
+"""Query-driven video interpretation with Qwen3-VL."""
 
 from app.insights.service import VideoInsightError, VideoInsightService
 

@@ -1,4 +1,4 @@
-"""Optimized Qwen2.5-VL inference for recorded videos and RTSP sequences."""
+"""Optimized Qwen-VL inference (Qwen3-VL or Qwen2.5-VL) for recorded videos and RTSP sequences."""
 
 from __future__ import annotations
 
@@ -985,7 +985,7 @@ LARGE_GPU_BYTES = 12 * GIB
 # recommends 256-1280 patches. 1280 patches hold a 1280x720 camera frame
 # without downscaling, which is what makes small bruises and mould visible.
 LARGE_GPU_PIXELS = (256 * 28 * 28, 1280 * 28 * 28)
-SMALL_GPU_PIXELS = (256 * 256, 512 * 512)
+SMALL_GPU_PIXELS = (256 * 256, 384 * 384)
 
 
 def _optional_env_int(name: str) -> int | None:
@@ -1043,7 +1043,7 @@ class VideoInsightService:
 
     def __init__(self) -> None:
         self.model_path = os.environ.get(
-            "VIDEO_INSIGHT_MODEL_PATH", "/models/Qwen2.5-VL-3B-Instruct"
+            "VIDEO_INSIGHT_MODEL_PATH", "/models/Qwen3-VL-2B-Instruct"
         )
         self.requested_precision = os.environ.get("VIDEO_INSIGHT_PRECISION", "").strip().lower() or "auto"
         if self.requested_precision not in PRECISIONS:
@@ -1071,7 +1071,8 @@ class VideoInsightService:
     def _load(self) -> tuple[Any, Any, Any]:
         try:
             import torch
-            from transformers import AutoProcessor, BitsAndBytesConfig, Qwen2_5_VLForConditionalGeneration
+            # Dispatches on the checkpoint's config: Qwen3-VL and Qwen2.5-VL both load.
+            from transformers import AutoModelForImageTextToText, AutoProcessor, BitsAndBytesConfig
         except ImportError as exc:
             raise VideoInsightError(
                 "video insight dependencies are unavailable; install the video-insight extra"
@@ -1120,7 +1121,7 @@ class VideoInsightService:
                 min_pixels=self.min_pixels,
                 max_pixels=self.max_pixels,
             )
-            model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
+            model = AutoModelForImageTextToText.from_pretrained(
                 str(model_path), **load_options
             )
             model.eval()

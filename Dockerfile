@@ -6,7 +6,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     VIDEO_ANALYTICS_JOBS_DIR=/app/output/dashboard \
     VIDEO_ANALYTICS_DETECTOR_MODEL=/app/All_weights/Weights_final/HumanDetection_light_input_640.onnx \
     VIDEO_ANALYTICS_REID_MODEL=/app/All_weights/Weights_final/Tracking_osnet_x0_25_msmt17.onnx \
-    VIDEO_INSIGHT_MODEL_PATH=/models/Qwen2.5-VL-3B-Instruct
+    VIDEO_INSIGHT_MODEL_PATH=/models/Qwen3-VL-2B-Instruct
 
 WORKDIR /app
 
