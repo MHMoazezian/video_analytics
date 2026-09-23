@@ -1170,6 +1170,8 @@ def test_pixel_budget_keeps_a_camera_frame_at_full_resolution_on_a_large_gpu() -
 
 
 def test_precision_and_pixel_settings_are_read_from_the_environment(monkeypatch) -> None:
+    # The image's own ENV sets a model path; pin it so the test reads the same everywhere.
+    monkeypatch.setenv("VIDEO_INSIGHT_MODEL_PATH", "/models/Qwen2.5-VL-3B-Instruct")
     monkeypatch.setenv("VIDEO_INSIGHT_PRECISION", " BF16 ")
     monkeypatch.setenv("VIDEO_INSIGHT_MAX_PIXELS", "1003520")
     monkeypatch.setenv("VIDEO_INSIGHT_MIN_PIXELS", "")  # an empty compose default means "unset"
