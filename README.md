@@ -10,7 +10,7 @@ It also adds queue progress toward each configured service point. A FastAPI
 integration layer now exposes recorded-video upload jobs and their generated
 artifacts to the Tarebar dashboard.
 
-The event-driven video-insight API reuses the optimized Qwen2.5-VL flow from
+The event-driven video-insight API uses a 4-bit Qwen3-VL-2B flow derived from
 `Action_recognition/test_vlm_qwen_optimized_video.py`: eight uniformly sampled
 RGB frames, bounded processor resolution, 4-bit NF4 weights with FP16 compute
 on CUDA, and deterministic generation. `POST /api/v1/video-insights` accepts a

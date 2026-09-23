@@ -1,4 +1,4 @@
-"""Optimized Qwen2.5-VL inference for recorded videos and RTSP sequences."""
+"""Optimized Qwen3-VL inference for recorded videos and RTSP sequences."""
 
 from __future__ import annotations
 
@@ -220,10 +220,10 @@ class VideoInsightService:
 
     def __init__(self) -> None:
         self.model_path = os.environ.get(
-            "VIDEO_INSIGHT_MODEL_PATH", "/models/Qwen2.5-VL-3B-Instruct"
+            "VIDEO_INSIGHT_MODEL_PATH", "/models/Qwen3-VL-2B-Instruct"
         )
         self.min_pixels = int(os.environ.get("VIDEO_INSIGHT_MIN_PIXELS", str(256 * 256)))
-        self.max_pixels = int(os.environ.get("VIDEO_INSIGHT_MAX_PIXELS", str(512 * 512)))
+        self.max_pixels = int(os.environ.get("VIDEO_INSIGHT_MAX_PIXELS", str(384 * 384)))
         self._model: Any = None
         self._processor: Any = None
         self._load_lock = Lock()
@@ -237,7 +237,7 @@ class VideoInsightService:
     def _load(self) -> tuple[Any, Any, Any]:
         try:
             import torch
-            from transformers import AutoProcessor, BitsAndBytesConfig, Qwen2_5_VLForConditionalGeneration
+            from transformers import AutoProcessor, BitsAndBytesConfig, Qwen3VLForConditionalGeneration
         except ImportError as exc:
             raise VideoInsightError(
                 "video insight dependencies are unavailable; install the video-insight extra"
@@ -272,7 +272,7 @@ class VideoInsightService:
                 )
             else:
                 load_options.update(device_map="cpu", torch_dtype=torch.float32)
-            model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
+            model = Qwen3VLForConditionalGeneration.from_pretrained(
                 str(model_path), **load_options
             )
             model.eval()

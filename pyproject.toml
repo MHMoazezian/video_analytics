@@ -32,8 +32,8 @@ video-insight = [
     "bitsandbytes==0.47.0",
     "huggingface-hub==0.34.4",
     "safetensors==0.6.2",
-    "tokenizers==0.21.4",
-    "transformers==4.55.4",
+    "tokenizers==0.22.1",
+    "transformers==4.57.1",
 ]
 dev = [
     "pytest>=8,<9",
