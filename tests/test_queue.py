@@ -355,4 +355,7 @@ def test_overlay_uses_one_stable_color_per_queue_and_one_summary_line() -> None:
     assert first_left_color == second_left_color == (255, 160, 0)
     assert right_color == (0, 200, 255)
     assert right_color != first_left_color
-    assert tuple(annotated[90, 100]) == (20, 20, 20)
+    # The summary bar covers the bottom 26 rows (75-100). Its text is wider than
+    # this tiny frame and runs over the middle rows, so sample the bar's top
+    # edge, which no glyph reaches.
+    assert tuple(annotated[76, 100]) == (20, 20, 20)

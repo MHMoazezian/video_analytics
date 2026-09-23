@@ -12,8 +12,10 @@ artifacts to the Tarebar dashboard.
 
 The event-driven video-insight API reuses the optimized Qwen2.5-VL flow from
 `Action_recognition/test_vlm_qwen_optimized_video.py`: eight uniformly sampled
-RGB frames, bounded processor resolution, 4-bit NF4 weights with FP16 compute
-on CUDA, and deterministic generation. `POST /api/v1/video-insights` accepts a
+RGB frames, bounded processor resolution, and deterministic generation. Precision
+and resolution follow the GPU (`VIDEO_INSIGHT_PRECISION=auto`): unquantized
+bf16/fp16 weights and full-resolution frames when the card can hold them, 4-bit
+NF4 weights and ~512x512 frames only on a small one; see "Model quality" below. `POST /api/v1/video-insights` accepts a
 recorded upload and video-time window; `POST /api/v1/video-insights/from-stream`
 samples a configurable live RTSP window. Both endpoints evaluate only whether
 people are fighting and whether the floor is clean. Generated model text stays
@@ -289,8 +291,9 @@ vertical-queue, configured-queue, and combined-analysis presets. Recorded-video
 analytics use `configs/cameras/example_lobby.yaml` when no camera YAML is
 uploaded. A validated YAML uploaded with a recorded job is persisted under the
 analytics jobs directory and becomes the default for later recorded jobs, so
-it only needs to be uploaded once. Set `VIDEO_ANALYTICS_CAMERA_CONFIG_PATH` to
-choose a different persistent path.
+it only needs to be uploaded once; a job submitted without a YAML reuses that
+saved default and never overwrites it. Set `VIDEO_ANALYTICS_CAMERA_CONFIG_PATH`
+to choose a different persistent path.
 
 Live RTSP sources use the same processing commands through
 `POST /api/v1/stream-jobs`. The JSON body accepts `stream_url`,
@@ -307,7 +310,202 @@ VIDEO_ANALYTICS_JOB_WORKERS=1
 VIDEO_ANALYTICS_MAX_UPLOAD_BYTES=1073741824
 VIDEO_ANALYTICS_CORS_ORIGINS=http://localhost:3000
 VIDEO_ANALYTICS_DETECTOR_MODEL=/absolute/path/to/model.onnx
+SERVICE_AUTH_SECRET=                      # unset/empty = no token check (default)
+VIDEO_ANALYTICS_RETENTION_DAYS=0          # 0 = keep finished jobs forever (default)
+VIDEO_ANALYTICS_CANCEL_GRACE_SECONDS=10   # then terminate(), kill() 5 s later
+VIDEO_INSIGHT_PRECISION=auto              # auto | bf16 | fp16 | 8bit | 4bit
+VIDEO_INSIGHT_MIN_PIXELS=                 # unset = follow the GPU size
+VIDEO_INSIGHT_MAX_PIXELS=
 ```
+
+#### Model quality
+
+The insight model is never weakened when the hardware can afford it.
+
+- `VIDEO_INSIGHT_PRECISION=auto` (default) loads the weights unquantized (bf16,
+  or fp16 on GPUs without bf16) when they fit in the free VRAM with 4 GiB of
+  headroom (`weights x 1.2 + 4 GiB`), and falls back to 4-bit NF4 otherwise.
+  The 3B model runs at full precision from a 16 GB card, the 7B model from
+  32 GB. `bf16`/`fp16`/`8bit`/`4bit` force one mode.
+- `VIDEO_INSIGHT_MIN_PIXELS` / `VIDEO_INSIGHT_MAX_PIXELS` bound what the model
+  sees per frame. Unset, they follow the GPU: from 12 GiB of VRAM on
+  `200704`-`1003520` (256-1280 patches of 28x28, the range of the model card; a
+  1280x720 camera frame is not downscaled), below that `65536`-`262144`. Small
+  defects such as bruises and mould spots depend on this more than on anything
+  else.
+- A larger checkpoint only needs `VIDEO_INSIGHT_MODEL_PATH` (any
+  `Qwen2.5-VL-*-Instruct` directory).
+- `GET /health` reports what is in effect: `"insights": {"model", "loaded",
+  "requested_precision", "precision", "min_pixels", "max_pixels"}`; the same
+  line is logged when the model loads.
+
+### HTTP API reference
+
+Every successful JSON response is wrapped as `{"data": ...}`.
+
+| Method and path | Purpose |
+|---|---|
+| `GET /health` | Always HTTP 200: `{"status":"ok"\|"degraded","analyticsStore":bool,"fleet":{...}}`. Any database problem (unreachable, not migrated yet) reports `degraded`. |
+| `GET /api/v1/fleet/status` | Always-on 0.5 FPS camera fleet: settings, last refresh/error and one entry per worker. |
+| `GET /api/v1/applications` | Application presets with their `metric_schema`. |
+| `GET /api/v1/trackers` | Registered tracker types. |
+| `GET /api/v1/jobs`, `GET /api/v1/jobs/{id}` | Job history and one job (`JobPublic`). |
+| `POST /api/v1/jobs` | Multipart recorded-video job: `video`, `application_id`, `camera_id`, `max_frames`, `enable_reid`, `tracker_type`, `camera_config`, `persist_camera_config`. |
+| `POST /api/v1/stream-jobs` | JSON live RTSP job: `stream_url`, `application_id` or `application_ids`, `camera_config_yaml`, `camera_id`, `max_frames`, `enable_reid`, `tracker_type`. |
+| `POST /api/v1/jobs/{id}/cancel` | Cooperative cancel marker, backed by a hard stop (see below). |
+| `GET /api/v1/jobs/{id}/events` | SSE tail of `events.jsonl` (`Last-Event-ID` / `?after=`). |
+| `GET /api/v1/jobs/{id}/preview`, `GET /api/v1/jobs/{id}/preview-stream` | Latest preview JPEG / MJPEG stream. |
+| `GET /api/v1/jobs/{id}/artifacts/{key}` | One artifact listed in `JobPublic.artifacts`. |
+| `GET /api/v1/jobs/{id}/report` | Job report (see "Job report and export"). |
+| `GET /api/v1/jobs/{id}/export.zip` | ZIP with `report.json`, `metrics.csv` and the job artifacts. |
+| `POST /api/v1/frames/first` | Multipart `video` → first frame as a JPEG data URL (zone editor fallback). |
+| `POST /api/v1/frames/from-stream` | JSON `{stream_url}` → one live still as a JPEG data URL. |
+| `POST /api/v1/preview-stream` | JSON `{stream_url}` → unannotated MJPEG of the camera. |
+| `POST /api/v1/video-insights`, `POST /api/v1/video-insights/from-stream` | Qwen2.5-VL answers to the two fixed questions. |
+| `POST /api/v1/fruit-quality`, `POST /api/v1/fruit-quality/from-stream` | Qwen2.5-VL fruit freshness (see "Fruit quality contract"). |
+| `GET /api/v1/restricted-area-events?camera_id=&limit=` | Recent restricted-area entry/exit events across jobs. |
+| `POST /api/v1/ingest/minutes` | Minute facts from producers; header `X-Analytics-Key` = `ANALYTICS_INGEST_KEY`. |
+| `GET /api/v1/management/overview\|people-flow\|queues\|spatial` | Management read models; header `X-Analytics-Key` = `ANALYTICS_READ_KEY`; query `from`, `to`, `locationType`, `locationId`, `placeType`, `comparison`, `bucket`, `timeFrom`, `timeTo`. Peak-period labels are rendered in `ANALYTICS_TIMEZONE`. |
+
+#### Service token (optional)
+
+Set `SERVICE_AUTH_SECRET` to the same value as the dashboard to require a token
+on every `/api/v1/*` route. `/api/v1/management/*` and `/api/v1/ingest/*` keep
+their `X-Analytics-Key` check instead, and `/health`, `/docs`, `/openapi.json`,
+`/redoc` and `OPTIONS` requests are never checked. With the variable unset or
+empty nothing is enforced.
+
+The token is a compact JWS signed with HS256 (unpadded base64url), header
+`{"alg":"HS256","typ":"JWT"}`, payload
+`{"iss":"tarebar","sub":"<userId>","role":"<Role>","iat":<unix>,"exp":<unix>}`.
+It must not be expired (30 s leeway) and `iss` must be `tarebar`. Send it as
+`Authorization: Bearer <token>` or, where headers cannot be set (`EventSource`,
+`<img>`, `<video>`, download links), as the `access_token=<token>` query
+parameter. A missing or invalid token is answered with HTTP 401
+`{"detail":"invalid or missing service token"}`; the response still carries the
+CORS headers, so the browser can read it.
+
+#### Video insight contract
+
+`POST /api/v1/video-insights` takes the form fields `video`, `num_frames`
+(2–16), `window_start_seconds`, `window_end_seconds` and `include_thumbnail`
+(default `false`); `/from-stream` takes the JSON fields `stream_url`,
+`num_frames`, `interval_seconds` (10–60) and `include_thumbnail`. The response
+is `{"answers":{"fighting":"Yes"|"No","floor_clean":"Yes"|"No"},"frame_count",
+"inference_seconds","thumbnail","model"}`; `thumbnail` is the middle sampled
+frame as a JPEG data URL (or `null`).
+
+#### Fruit quality contract
+
+`POST /api/v1/fruit-quality` takes the form fields `media` (image or video),
+`num_frames` (1–16), and the optional `detail_level` (`summary` default, or
+`detailed`), `per_frame` (default `false`) and `include_thumbnails` (default
+`false`). `/from-stream` takes `stream_url`, `num_frames` (2–16),
+`interval_seconds` and the same three optional JSON fields. The defaults return
+exactly the original verdict plus the new, empty fields.
+
+```json
+{
+  "has_fruit": true, "label": "تازه", "freshness_score": 92,
+  "distribution": {"fresh": 90, "middle": 8, "rotten": 2},
+  "fruit_count_estimate": 14, "confidence": 85, "summary_fa": "…", "verdict_fa": "…",
+  "frame_count": 8, "inference_seconds": 5.2,
+  "analysis_version": 2, "detail_level": "detailed", "model": "Qwen2.5-VL-3B-Instruct",
+  "grade": "A",
+  "fruit_types": [{"name_fa": "سیب", "share_percent": 70}],
+  "defects": [{"type": "bruising", "label_fa": "کوفتگی", "severity": "low",
+               "affected_percent": 10, "note_fa": "…"}],
+  "shelf_life_days_estimate": 5, "recommendation_fa": "…", "model_recommendation_fa": "…",
+  "storage_advice_fa": "…",
+  "frames": [{"index": 0, "timestamp_seconds": 1.2, "has_fruit": true, "freshness_score": 90,
+              "label": "تازه", "note_fa": "…", "thumbnail": "data:image/jpeg;base64,…", "error": null}],
+  "frame_statistics": {"analyzed": 8, "score_min": 85, "score_max": 95,
+                       "score_mean": 90.1, "score_stddev": 3.2},
+  "total_seconds": 12.3
+}
+```
+
+- The core fields are validated strictly (a violation is HTTP 503). `grade` is
+  derived by the service from `freshness_score` (≥85 A, ≥70 B, ≥50 C, else D;
+  `null` without fruit) and never taken from the model.
+- The analysis starts with a one-word presence question (is any fruit or
+  vegetable visible?) on at most three evenly spaced frames. Only a clear "No"
+  ends it there with the no-fruit result (`has_fruit: false`, label `نامشخص`,
+  score 0, `grade: null`, HTTP 200). The 3B model answers that question
+  reliably, whereas it fills `has_fruit` of the long answer with `true` for any
+  picture.
+- Text a manager acts on is composed by the service from the validated numbers,
+  never by the model: `verdict_fa` puts label, score, grade, shares and count
+  into one Persian sentence, and `recommendation_fa` is the action for the grade
+  (`FRUIT_ACTIONS_FA`), present at every detail level and `null` without fruit.
+  The model's own advice is kept as `model_recommendation_fa` for the record
+  only; on real photos it contradicted its own score ("sell it quickly" for a
+  rotten apple).
+- `summary_fa` is the model's observation after cleaning: echoed instruction
+  prefixes, first-person chatter and repetition loops are removed and the text
+  is cut to 500 characters. When nothing usable is left it equals `verdict_fa`.
+- An answer cut off by the token limit is recovered instead of failing: the
+  object is closed after its last complete member and a long cut-off sentence
+  ends at its last full stop. Only an answer without the core numbers is a 503.
+- `fruit_types`, `defects`, `shelf_life_days_estimate`, `model_recommendation_fa`
+  and `storage_advice_fa` are filled only for `detail_level=detailed` (otherwise
+  `[]`/`null`) and parsed leniently: an invalid entry (for example a sentence in
+  place of a fruit name) is dropped, never an error. Defect `type` is one of `bruising, mold, discoloration, soft_spot,
+  wrinkling, dryness, decay, cut_damage, pest_damage, other` (an unlisted type
+  becomes `other`), `severity` one of `low, medium, high`; `label_fa` is the
+  service's Persian label for the type. If the detailed answer is unusable the
+  service asks again with the summary prompt and returns empty detail fields.
+- `frames` is `[]` unless `per_frame` or `include_thumbnails` is set.
+  `per_frame` runs one compact single-image prompt per sampled frame after the
+  aggregate verdict; a failing frame gets an `error` string and `null` scores
+  and never fails the request. With only `include_thumbnails` the scores stay
+  `null`. `timestamp_seconds` is the video time, the seconds since the first
+  live sample, `0` for an image, or `null` when the video has no frame rate.
+- `frame_statistics.analyzed` counts the successfully analysed frames; the score
+  figures (population standard deviation) cover the analysed frames that show
+  fruit and are `null` when there are none.
+- Thumbnails are JPEG data URLs, at most 320 px wide, quality 70.
+- On a GPU out-of-memory error the service frees the CUDA cache and retries once
+  with half of the frames (`frame_count` reports the frames actually used). If
+  that fails too, and for any other unexpected failure, the answer is HTTP 503
+  with a readable `detail`, never a 500.
+
+#### Job report and export
+
+`GET /api/v1/jobs/{id}/report` returns
+`{"job": JobPublic, "configuration": {...}, "final_metrics": {...},
+"metric_statistics": {"<key>": {"min","max","mean","last","samples"}},
+"event_counts": {"<type>": n}, "analytics_event_counts": {"<event_type>": n},
+"duration_seconds": n, "generated_at": iso}`. Statistics cover every numeric
+top-level metric in `metrics.jsonl`; `duration_seconds` is the processing time
+reported by the pipeline, falling back to `updated_at - created_at`.
+
+`GET /api/v1/jobs/{id}/export.zip` downloads `report.json`, `metrics.csv` (one
+row per `metrics.jsonl` line: `timestamp, frame_index, elapsed_seconds`, then
+every numeric metric key, blank when missing) and every artifact of the job
+under `artifacts/`. The uploaded input video is never included.
+
+#### Cancellation and retention
+
+Cancelling a job writes the cooperative `cancel.requested` marker. If the
+subprocess is still alive after `VIDEO_ANALYTICS_CANCEL_GRACE_SECONDS`
+(default 10) it is sent `terminate()`, and `kill()` five seconds later, so a
+process stuck on an RTSP connect or a model load no longer blocks the worker.
+
+Set `VIDEO_ANALYTICS_RETENTION_DAYS` to a positive number to delete the
+directories of completed, failed and cancelled jobs whose last update is older
+than that many days. The sweep runs at startup and every six hours; the default
+`0` disables it. Running jobs and the `_settings` directory are never touched.
+
+#### Management store notes
+
+Before a minute document is written to the outbox it is clamped to the ingest
+limits (`sampleCount` ≤ 3600, `waitSampleCount` ≤ 1000 with the sums scaled to
+keep the averages, ≤ 500 completed waits and events, ≤ 100 queues, ≤ 32 spatial
+layers of ≤ 256 points), so a fast recorded job can no longer lose a minute to
+an HTTP 422. Fleet cameras have no counting lines; their `entries` are the
+cumulative unique confirmed people and their `exits` the expired tracks (never
+more than the entries). Cameras with counting lines keep directed line counts.
 
 ### Run with Docker
 

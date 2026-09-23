@@ -20,7 +20,14 @@ batch use remains unchanged when those options are omitted.
   the browser retains the last decoded frame until the next complete JPEG is
   available.
 - `POST /api/v1/jobs/{job_id}/cancel` requests cancellation. Processing stops
-  at the next frame boundary and records `job_cancelled`.
+  at the next frame boundary and records `job_cancelled`. A process that has
+  not stopped after `VIDEO_ANALYTICS_CANCEL_GRACE_SECONDS` (default 10) is
+  terminated, and killed five seconds later.
+- `GET /api/v1/jobs/{job_id}/report` and `GET /api/v1/jobs/{job_id}/export.zip`
+  return the job report and a ZIP of the report, `metrics.csv` and artifacts.
+
+The complete route list, the optional service token and the insight contracts
+are documented in the README ("HTTP API reference").
 
 ## Event contract
 

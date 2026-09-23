@@ -60,11 +60,17 @@ class AnalyticsRepository:
             raise AnalyticsUnavailable("analytical PostgreSQL store is unavailable") from exc
 
     def health(self) -> bool:
+        """Report store availability without ever raising.
+
+        ``GET /health`` must answer 200 ``degraded`` for every database problem,
+        including a schema that has not been migrated yet (``UndefinedTable``).
+        """
+
         try:
             with self.connection() as connection, connection.cursor() as cursor:
                 cursor.execute("SELECT 1 FROM analytics_camera_source LIMIT 1")
             return True
-        except AnalyticsUnavailable:
+        except Exception:  # noqa: BLE001 - a health probe reports, it never fails
             return False
 
     def ingest(

@@ -3,6 +3,8 @@ from threading import Lock
 import numpy as np
 import pytest
 
+import app.fleet.pipeline as pipeline_module
+from app.core.models import TrackObservation, TrajectoryPoint
 from app.fleet.catalog import cameras_from_rows, parse_polygon, rewrite_stream_url
 from app.fleet.geometry import build_camera_config, camera_config_mapping
 from app.fleet.pipeline import CameraPipeline, EmptyDetector
@@ -11,6 +13,7 @@ from app.fleet.settings import FLEET_FPS, FLEET_INTERVAL_SECONDS, FleetSettings
 from app.fleet.supervisor import FleetSupervisor
 from app.fleet.catalog import FleetCamera, MappedZone
 from app.management.publisher import MinutePublisher
+from app.tracking.base import BaseTracker, TrackingResult
 
 
 class FakeClock:
@@ -171,6 +174,92 @@ def test_pipeline_processes_one_empty_frame_without_writing_job_artifacts(tmp_pa
     assert metrics["processing_fps"] is not None
     assert metrics["management_spatial_layers"] is not None
     assert list(tmp_path.iterdir()) == []
+
+
+class ScriptedTracker(BaseTracker):
+    """Replays (visible track ids, expired track ids) per frame."""
+
+    name = "scripted"
+
+    def __init__(self, script: list[tuple[tuple[int, ...], tuple[int, ...]]]) -> None:
+        self.script = list(script)
+
+    def update(self, detections, *, camera_id, timestamp, frame_index, frame=None, intermediate_frame=None):
+        visible, expired = self.script.pop(0)
+        observations = tuple(
+            TrackObservation(
+                camera_id=camera_id,
+                track_id=track_id,
+                timestamp=timestamp,
+                frame_index=frame_index,
+                xyxy=(100.0, 100.0, 140.0, 220.0),
+                foot_point=(120.0, 220.0),
+                detection_confidence=0.9,
+                confirmed=True,
+                trajectory=(TrajectoryPoint(timestamp, frame_index, (120.0, 220.0), (120.0, 220.0)),),
+            )
+            for track_id in visible
+        )
+        return TrackingResult(observations, expired, tracking_ms=0.0, tracker_name=self.name)
+
+    def reset(self) -> None:
+        self.script.clear()
+
+    @property
+    def reid_enabled(self) -> bool:
+        return False
+
+    @property
+    def retained_track_count(self) -> int:
+        return 0
+
+
+def _scripted_pipeline(tmp_path, monkeypatch, script) -> CameraPipeline:
+    monkeypatch.delenv("VIDEO_ANALYTICS_INGEST_URL", raising=False)
+    monkeypatch.setenv("ANALYTICS_OUTBOX_DIR", str(tmp_path))
+    monkeypatch.setattr(pipeline_module, "create_tracker", lambda *_args, **_kwargs: ScriptedTracker(script))
+    return CameraPipeline(
+        _camera(),
+        FleetSettings.from_environ({}),
+        EmptyDetector(),
+        Lock(),
+        publisher=MinutePublisher("cam-1", "Entrance"),
+    )
+
+
+def test_pipeline_without_counting_lines_derives_traffic_from_track_identities(tmp_path, monkeypatch) -> None:
+    pipeline = _scripted_pipeline(
+        tmp_path,
+        monkeypatch,
+        [
+            ((1, 2), ()),       # two people appear
+            ((2, 3), ()),       # a third appears, the first is only lost for now
+            ((3,), (1,)),       # the first person's track expires
+            ((), (2, 3, 9)),    # 9 was never confirmed: exits stay capped by entries
+            ((), (3,)),         # a repeated expiry is not a second exit
+        ],
+    )
+    frame = np.zeros((480, 640, 3), dtype=np.uint8)
+    traffic = []
+    for index in range(5):
+        metrics = pipeline.process(frame, timestamp=10.0 + 2.0 * index)
+        traffic.append((metrics["entry_count"], metrics["exit_count"], metrics["total_unique_people"]))
+    pipeline.close()
+
+    assert traffic == [(2, 0, 2), (3, 0, 3), (3, 1, 3), (3, 3, 3), (3, 3, 3)]
+
+
+def test_pipeline_with_counting_lines_keeps_line_crossing_counts(tmp_path, monkeypatch) -> None:
+    pipeline = _scripted_pipeline(tmp_path, monkeypatch, [((1, 2), ()), ((), (1, 2))])
+    frame = np.zeros((480, 640, 3), dtype=np.uint8)
+    pipeline.process(frame, timestamp=10.0)
+    # Same situation as above, but the camera now reports a configured counting line.
+    pipeline._has_counting_lines = True
+    metrics = pipeline.process(frame, timestamp=12.0)
+    pipeline.close()
+
+    assert metrics["total_unique_people"] == 2
+    assert (metrics["entry_count"], metrics["exit_count"]) == (0, 0)
 
 
 def test_supervisor_starts_and_replaces_cameras_without_touching_on_demand_jobs() -> None:

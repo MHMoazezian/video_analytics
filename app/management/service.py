@@ -4,9 +4,10 @@ from __future__ import annotations
 
 from collections import defaultdict
 import calendar
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone, tzinfo
 import os
 from typing import Iterable
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from app.management.models import AnalyticsQuery
 from app.management.repository import (
@@ -51,6 +52,15 @@ def _shift_month(value: datetime) -> datetime:
     month = value.month - 1 if value.month > 1 else 12
     day = min(value.day, calendar.monthrange(year, month)[1])
     return value.replace(year=year, month=month, day=day)
+
+
+def _business_zone() -> tzinfo:
+    """Zone used for human-readable labels; mirrors the query-date handling."""
+
+    try:
+        return ZoneInfo(os.environ.get("ANALYTICS_TIMEZONE", "Asia/Tehran"))
+    except (ValueError, ZoneInfoNotFoundError):
+        return timezone.utc
 
 
 def _target_type(query: AnalyticsQuery) -> str:
@@ -331,8 +341,9 @@ class ManagementAnalyticsService:
         rows = self._flow_trend(query, start, end, rollup_type)
         duration = timedelta(days=1) if query.bucket == "day" else timedelta(hours=1)
         ranked = sorted((row for row in rows if row.get("occupancy") is not None), key=lambda row: float(row["occupancy"]), reverse=True)[:8]
+        local_zone = _business_zone()
         return [{"from": row["timestamp"].isoformat(), "to": (row["timestamp"] + duration).isoformat(),
-                 "value": round(float(row["occupancy"]), 2), "label": f"اوج {row['timestamp'].astimezone().strftime('%H:%M')}"} for row in ranked]
+                 "value": round(float(row["occupancy"]), 2), "label": f"اوج {row['timestamp'].astimezone(local_zone).strftime('%H:%M')}"} for row in ranked]
 
     def _activity_heatmap(self, query: AnalyticsQuery, start: datetime, end: datetime, rollup_type: str) -> list[dict[str, object]]:
         predicate, params = rollup_location_predicate("h", rollup_type, query.location_type, query.location_id)

@@ -58,6 +58,8 @@ class CameraPipeline:
         self.processed_frames = 0
         self.restricted_violations = 0
         self._last_spatial_publish: float | None = None
+        self._has_counting_lines = False
+        self._expired_track_ids: set[int] = set()
         self._closed = False
 
     def close(self) -> None:
@@ -113,12 +115,21 @@ class CameraPipeline:
         if include_spatial:
             self._last_spatial_publish = sample_time
         snapshot = counted.snapshot
+        self._expired_track_ids.update(tracked.expired_track_ids)
+        if self._has_counting_lines:
+            entries, exits = snapshot.cumulative_entries, snapshot.cumulative_exits
+        else:
+            # Fleet cameras are mapped without counting lines, so directed line
+            # crossings never happen. Traffic is approximated from identities:
+            # every confirmed person entered the view, every expired track left it.
+            entries = snapshot.total_unique_people
+            exits = min(entries, len(self._expired_track_ids))
         metrics = live_metrics(
             current_people=snapshot.current_people,
             unique_people=snapshot.total_unique_people,
             active_tracks=len(observations),
-            entries=snapshot.cumulative_entries,
-            exits=snapshot.cumulative_exits,
+            entries=entries,
+            exits=exits,
             occupancy={item.zone_id: item.current for item in snapshot.occupancy},
             restricted=intrusion.snapshot if intrusion is not None else None,
             restricted_violations=self.restricted_violations,
@@ -158,6 +169,9 @@ class CameraPipeline:
             frame_size=frame_size,
         )
         self._counter = PeopleCounter((counting,))
+        self._has_counting_lines = bool(counting.counting_lines)
+        # A rebuilt tracker restarts its identities, so the exit ledger restarts too.
+        self._expired_track_ids = set()
         self._restricted = (
             RestrictedAreaDetector((restricted_config,)) if restricted_config.zones else None
         )

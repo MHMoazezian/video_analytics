@@ -1,5 +1,7 @@
 from pathlib import Path
 import json
+import threading
+import time
 
 import app.api.jobs as jobs_module
 import numpy as np
@@ -396,6 +398,110 @@ def test_cancel_request_is_persisted_for_running_process(tmp_path: Path) -> None
 
     assert cancelled.status == "cancelling"
     assert (job_dir / "cancel.requested").is_file()
+
+
+class _FakeProcess:
+    """Popen stand-in whose reaction to terminate() is scripted by the test."""
+
+    def __init__(self, *, exits_on_terminate: bool, already_exited: bool = False) -> None:
+        self.exits_on_terminate = exits_on_terminate
+        self.returncode: int | None = 0 if already_exited else None
+        self.terminated = threading.Event()
+        self.killed = threading.Event()
+
+    def poll(self) -> int | None:
+        return self.returncode
+
+    def terminate(self) -> None:
+        self.terminated.set()
+        if self.exits_on_terminate:
+            self.returncode = -15
+
+    def kill(self) -> None:
+        self.killed.set()
+        self.returncode = -9
+
+
+def _running_job(tmp_path: Path, process: _FakeProcess, **options: float) -> tuple[JobManager, str]:
+    manager = JobManager(tmp_path, **options)
+    job_dir = tmp_path / "job-stuck"
+    job_dir.mkdir()
+    source = job_dir / "input.mp4"
+    source.touch()
+    record = manager.register(
+        job_id="job-stuck",
+        application_id="tracking",
+        original_filename="shop.mp4",
+        camera_id="camera",
+        input_video=source,
+        camera_config=None,
+        max_frames=None,
+    )
+    manager._update(record, status="running")
+    manager._processes[record.id] = process  # type: ignore[assignment]
+    return manager, record.id
+
+
+def test_cancel_terminates_then_kills_a_process_that_ignores_the_marker(tmp_path: Path) -> None:
+    process = _FakeProcess(exits_on_terminate=False)
+    manager, job_id = _running_job(
+        tmp_path, process, cancel_grace_seconds=0.5, cancel_kill_delay_seconds=0.05
+    )
+
+    started = time.monotonic()
+    record = manager.cancel(job_id)
+    returned_after = time.monotonic() - started
+
+    # The HTTP request is answered immediately; the hard stop runs on a daemon timer.
+    assert record.status == "cancelling"
+    assert not process.terminated.is_set()
+    assert returned_after < 0.5
+    assert manager._cancel_timers[job_id].daemon is True
+    assert (tmp_path / "job-stuck" / "cancel.requested").is_file()
+
+    assert process.terminated.wait(timeout=5)
+    assert process.killed.wait(timeout=5)
+
+
+def test_cancel_does_not_kill_a_process_that_exits_on_terminate(tmp_path: Path) -> None:
+    process = _FakeProcess(exits_on_terminate=True)
+    manager, job_id = _running_job(
+        tmp_path, process, cancel_grace_seconds=0.05, cancel_kill_delay_seconds=0.2
+    )
+
+    manager.cancel(job_id)
+    manager.cancel(job_id)  # a repeated request must not stack timers
+
+    assert process.terminated.wait(timeout=5)
+    deadline = time.monotonic() + 5
+    while job_id in manager._cancel_timers and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert job_id not in manager._cancel_timers
+    assert not process.killed.is_set()
+
+
+def test_cancel_leaves_a_cooperative_process_alone(tmp_path: Path) -> None:
+    process = _FakeProcess(exits_on_terminate=True)
+    manager, job_id = _running_job(
+        tmp_path, process, cancel_grace_seconds=0.1, cancel_kill_delay_seconds=0.05
+    )
+
+    manager.cancel(job_id)
+    process.returncode = 0  # the CLI noticed cancel.requested within the grace period
+    timer = manager._cancel_timers[job_id]
+    timer.join(timeout=5)
+
+    assert not process.terminated.is_set()
+    assert not process.killed.is_set()
+
+
+def test_cancel_grace_period_comes_from_the_environment(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.delenv("VIDEO_ANALYTICS_CANCEL_GRACE_SECONDS", raising=False)
+    assert JobManager(tmp_path / "default").cancel_grace_seconds == 10.0
+    monkeypatch.setenv("VIDEO_ANALYTICS_CANCEL_GRACE_SECONDS", "2.5")
+    assert JobManager(tmp_path / "configured").cancel_grace_seconds == 2.5
+    monkeypatch.setenv("VIDEO_ANALYTICS_CANCEL_GRACE_SECONDS", "soon")
+    assert JobManager(tmp_path / "invalid").cancel_grace_seconds == 10.0
 
 
 def test_dashboard_processing_size_preserves_aspect_ratio_and_avoids_upscale() -> None:

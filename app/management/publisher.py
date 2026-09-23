@@ -202,6 +202,7 @@ class MinutePublisher:
             for expired in pending[:len(pending)-self.max_outbox_files+1]:
                 expired.unlink(missing_ok=True)
         temporary = destination.with_suffix(".tmp")
+        clamp_observation(observation)
         temporary.write_text(json.dumps({"observations": [observation]}, separators=(",", ":")), encoding="utf-8")
         temporary.replace(destination)
 
@@ -242,6 +243,67 @@ class MinutePublisher:
         except (OSError, URLError, TimeoutError) as exc:
             logger.warning("analytics ingest unavailable for %s: %s", path.name, exc)
             return False
+
+
+# Upper bounds of the ingest contract in ``app.management.models``. A recorded job
+# can process far more than one frame per wall-clock second, and a payload above
+# these bounds is rejected with 422 and dropped, losing the whole minute.
+MAX_SAMPLES_PER_MINUTE = 3600
+MAX_WAIT_SAMPLES = 1000
+MAX_COMPLETED_WAITS = 500
+MAX_QUEUES = 100
+MAX_EVENTS = 500
+MAX_SPATIAL_LAYERS = 32
+MAX_SPATIAL_POINTS = 256
+
+
+def _clamp_count(item: dict[str, object], count_key: str, limit: int, sum_key: str) -> None:
+    """Cap a sample counter and scale its paired sum so the average is preserved."""
+
+    count = item.get(count_key)
+    if isinstance(count, bool) or not isinstance(count, int) or count <= limit:
+        return
+    total = item.get(sum_key)
+    if isinstance(total, (int, float)) and not isinstance(total, bool):
+        item[sum_key] = float(total) * limit / count
+    item[count_key] = limit
+
+
+def clamp_observation(observation: dict[str, object]) -> dict[str, object]:
+    """Fit one ``CameraMinute`` document into the ingest limits, in place."""
+
+    _clamp_count(observation, "sampleCount", MAX_SAMPLES_PER_MINUTE, "occupancySum")
+    expected = observation.get("expectedSamples")
+    if isinstance(expected, int) and not isinstance(expected, bool):
+        observation["expectedSamples"] = min(max(expected, 1), MAX_SAMPLES_PER_MINUTE)
+    samples = observation.get("sampleCount")
+    confidence = observation.get("confidenceSum")
+    if isinstance(confidence, (int, float)) and not isinstance(confidence, bool):
+        ceiling = float(min(MAX_SAMPLES_PER_MINUTE, samples)) if isinstance(samples, int) else float(MAX_SAMPLES_PER_MINUTE)
+        observation["confidenceSum"] = max(0.0, min(float(confidence), ceiling))
+    queues = observation.get("queues")
+    if isinstance(queues, list):
+        del queues[MAX_QUEUES:]
+        for queue in queues:
+            if not isinstance(queue, dict):
+                continue
+            _clamp_count(queue, "sampleCount", MAX_SAMPLES_PER_MINUTE, "lengthSum")
+            _clamp_count(queue, "waitSampleCount", MAX_WAIT_SAMPLES, "waitSumSeconds")
+            waits = queue.get("completedWaitSeconds")
+            if isinstance(waits, list):
+                # Keep the oldest entries: ingestion derives idempotent event ids
+                # from the list position, which must stay stable between snapshots.
+                del waits[MAX_COMPLETED_WAITS:]
+    events = observation.get("events")
+    if isinstance(events, list) and len(events) > MAX_EVENTS:
+        observation["events"] = events[-MAX_EVENTS:]
+    spatial = observation.get("spatial")
+    if isinstance(spatial, list):
+        del spatial[MAX_SPATIAL_LAYERS:]
+        for layer in spatial:
+            if isinstance(layer, dict) and isinstance(layer.get("points"), list):
+                layer["points"] = layer["points"][:MAX_SPATIAL_POINTS]
+    return observation
 
 
 def _severity(event_type: str) -> str:

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field, fields
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from concurrent.futures import Future, ThreadPoolExecutor
 import json
 import mimetypes
@@ -14,13 +14,16 @@ import subprocess
 import sys
 import threading
 import time
-from typing import Any
+from typing import Any, Iterable
 
 from app.api.presets import ApplicationPreset, get_application
 from app.core.config import PROJECT_ROOT
 
 
 TERMINAL_STATUSES = frozenset({"completed", "failed", "cancelled"})
+SETTINGS_DIRECTORY_NAME = "_settings"
+DEFAULT_CANCEL_GRACE_SECONDS = 10.0
+CANCEL_KILL_DELAY_SECONDS = 5.0
 
 
 def _now() -> str:
@@ -60,6 +63,8 @@ class JobManager:
         max_workers: int = 1,
         processing_width: int = 1280,
         frame_stride: int = 5,
+        cancel_grace_seconds: float | None = None,
+        cancel_kill_delay_seconds: float = CANCEL_KILL_DELAY_SECONDS,
     ) -> None:
         if max_workers <= 0:
             raise ValueError("max_workers must be positive")
@@ -72,6 +77,12 @@ class JobManager:
         self.python_executable = python_executable or sys.executable
         self.processing_width = processing_width
         self.frame_stride = frame_stride
+        self.cancel_grace_seconds = (
+            _cancel_grace_from_environ()
+            if cancel_grace_seconds is None
+            else max(0.0, cancel_grace_seconds)
+        )
+        self.cancel_kill_delay_seconds = max(0.0, cancel_kill_delay_seconds)
         self._jobs: dict[str, JobRecord] = {}
         self._lock = threading.RLock()
         self._executor = ThreadPoolExecutor(
@@ -79,6 +90,7 @@ class JobManager:
         )
         self._futures: dict[str, Future[None]] = {}
         self._processes: dict[str, subprocess.Popen[str]] = {}
+        self._cancel_timers: dict[str, threading.Timer] = {}
         self._load_existing()
 
     def register(
@@ -238,7 +250,73 @@ class JobManager:
         (job_dir / "cancel.requested").touch()
         self._update(record, status="cancelling")
         self._append_event(record, "warning", status="cancelling", message="Cancellation requested")
+        self._schedule_forced_stop(job_id)
         return record
+
+    def _schedule_forced_stop(self, job_id: str) -> None:
+        """Back the cooperative marker with a hard stop, off the request thread.
+
+        The CLI only notices ``cancel.requested`` when it publishes a frame, so a
+        process blocked on an RTSP open, a model load, or ffmpeg would otherwise
+        hold its worker slot forever.
+        """
+
+        with self._lock:
+            if job_id in self._cancel_timers:
+                return
+            timer = threading.Timer(
+                self.cancel_grace_seconds, self._force_stop, args=(job_id,)
+            )
+            timer.daemon = True
+            timer.name = f"video-analytics-cancel-{job_id}"
+            self._cancel_timers[job_id] = timer
+        timer.start()
+
+    def _force_stop(self, job_id: str) -> None:
+        """terminate() a process that outlived the grace period, then kill() it."""
+
+        try:
+            with self._lock:
+                process = self._processes.get(job_id)
+            if process is None or process.poll() is not None:
+                return
+            process.terminate()
+            deadline = time.monotonic() + self.cancel_kill_delay_seconds
+            while time.monotonic() < deadline:
+                if process.poll() is not None:
+                    return
+                time.sleep(min(0.1, self.cancel_kill_delay_seconds))
+            if process.poll() is None:
+                process.kill()
+        except OSError:
+            # The process exited between poll() and the signal.
+            pass
+        finally:
+            with self._lock:
+                self._cancel_timers.pop(job_id, None)
+
+    def purge_expired(
+        self, retention_days: float, *, now: datetime | None = None
+    ) -> list[str]:
+        """Delete finished jobs older than the retention window; return their ids."""
+
+        with self._lock:
+            expired = select_expired_jobs(
+                self._jobs.values(), retention_days=retention_days, now=now
+            )
+        removed: list[str] = []
+        for record in expired:
+            job_dir = Path(record.job_directory).resolve()
+            if not _is_purgeable_directory(job_dir, self.root):
+                continue
+            shutil.rmtree(job_dir, ignore_errors=True)
+            if job_dir.exists():
+                continue
+            with self._lock:
+                self._jobs.pop(record.id, None)
+                self._futures.pop(record.id, None)
+            removed.append(record.id)
+        return removed
 
     def public_dict(self, record: JobRecord) -> dict[str, Any]:
         data = asdict(record)
@@ -463,6 +541,56 @@ class JobManager:
                 self._jobs[record.id] = record
             except (OSError, TypeError, ValueError, json.JSONDecodeError):
                 continue
+
+
+def _cancel_grace_from_environ() -> float:
+    try:
+        value = float(
+            os.environ.get("VIDEO_ANALYTICS_CANCEL_GRACE_SECONDS", DEFAULT_CANCEL_GRACE_SECONDS)
+        )
+    except (TypeError, ValueError):
+        return DEFAULT_CANCEL_GRACE_SECONDS
+    return max(0.0, value)
+
+
+def select_expired_jobs(
+    records: Iterable[JobRecord],
+    *,
+    retention_days: float,
+    now: datetime | None = None,
+) -> list[JobRecord]:
+    """Return finished jobs whose last update is older than ``retention_days``.
+
+    Retention is opt-in: zero or a negative value selects nothing. Jobs that are
+    still queued, running, or cancelling are never selected, whatever their age.
+    """
+
+    if retention_days <= 0:
+        return []
+    cutoff = (now or datetime.now(timezone.utc)) - timedelta(days=retention_days)
+    expired: list[JobRecord] = []
+    for record in records:
+        if record.status not in TERMINAL_STATUSES:
+            continue
+        try:
+            updated = datetime.fromisoformat(record.updated_at)
+        except (TypeError, ValueError):
+            continue
+        if updated.tzinfo is None:
+            updated = updated.replace(tzinfo=timezone.utc)
+        if updated < cutoff:
+            expired.append(record)
+    return expired
+
+
+def _is_purgeable_directory(job_dir: Path, root: Path) -> bool:
+    """Only direct children of the jobs root, and never the settings directory."""
+
+    return (
+        job_dir.parent == root
+        and job_dir.name != SETTINGS_DIRECTORY_NAME
+        and not job_dir.name.startswith(".")
+    )
 
 
 def _read_json(path: Path) -> dict[str, Any] | None:

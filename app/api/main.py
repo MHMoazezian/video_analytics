@@ -4,13 +4,15 @@ from __future__ import annotations
 
 import os
 import json
+import logging
+from contextlib import contextmanager
 from pathlib import Path
 import re
 import shutil
 import asyncio
 import tempfile
 import time
-from typing import Annotated, Iterator
+from typing import Annotated, Iterator, Literal
 from uuid import uuid4
 
 import cv2
@@ -18,7 +20,9 @@ from fastapi import FastAPI, File, Form, Header, HTTPException, Query, UploadFil
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field, field_validator
+from starlette.background import BackgroundTask
 
+from app.api.auth import ServiceTokenMiddleware
 from app.api.frames import (
     FrameCaptureError,
     encode_jpeg_data_url,
@@ -28,6 +32,7 @@ from app.api.frames import (
 )
 from app.api.jobs import JobManager
 from app.api.presets import APPLICATIONS, get_application
+from app.api.reports import build_job_report, write_job_export_zip
 from app.core.config import DEFAULT_CAMERA_CONFIG_PATH, PROJECT_ROOT
 from app.geometry.config import load_camera_config
 from app.fleet.supervisor import fleet_supervisor
@@ -37,10 +42,11 @@ from app.insights import VideoInsightError, VideoInsightService
 from app.tracking.factory import available_tracker_types, public_tracker_catalog
 
 
+logger = logging.getLogger(__name__)
+
 JOBS_ROOT = Path(
     os.environ.get("VIDEO_ANALYTICS_JOBS_DIR", PROJECT_ROOT / "output" / "dashboard")
 )
-DEFAULT_CAMERA_CONFIG_PATH = PROJECT_ROOT / "configs" / "cameras" / "example_lobby.yaml"
 SAVED_CAMERA_CONFIG_PATH = Path(
     os.environ.get(
         "VIDEO_ANALYTICS_CAMERA_CONFIG_PATH",
@@ -66,6 +72,11 @@ origins = [
     ).split(",")
     if item.strip()
 ]
+# Starlette inserts every added middleware at the front of its list and wraps the
+# router from the back, so the middleware added LAST is the OUTERMOST one. The
+# token check is therefore registered first and CORS last: CORS answers preflight
+# requests itself and decorates the 401 responses produced by the token check.
+app.add_middleware(ServiceTokenMiddleware)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=origins,
@@ -75,12 +86,42 @@ app.add_middleware(
 )
 app.include_router(management_router)
 
+RETENTION_SWEEP_SECONDS = 6 * 60 * 60
+EXPORT_SCRATCH_PREFIX = ".export-"
+
+
+def _retention_days() -> float:
+    """Opt-in job retention; anything but a positive number keeps every job."""
+
+    try:
+        return max(0.0, float(os.environ.get("VIDEO_ANALYTICS_RETENTION_DAYS", "0") or 0))
+    except ValueError:
+        return 0.0
+
+
+async def retention_worker(days: float) -> None:
+    """Purge expired finished jobs at startup and then every six hours."""
+
+    while True:
+        try:
+            removed = await asyncio.to_thread(manager.purge_expired, days)
+            if removed:
+                logger.info("retention removed %d job(s) older than %s day(s)", len(removed), days)
+        except Exception:  # noqa: BLE001 - housekeeping must never stop the service
+            logger.exception("job retention sweep failed")
+        await asyncio.sleep(RETENTION_SWEEP_SECONDS)
+
 
 @app.on_event("startup")
 async def start_analytics_store() -> None:
     analytics_repository.open()
     app.state.analytics_rollup_task = asyncio.create_task(rollup_worker())
     app.state.fleet_task = asyncio.create_task(asyncio.to_thread(fleet_supervisor.start))
+    for leftover in JOBS_ROOT.glob(f"{EXPORT_SCRATCH_PREFIX}*.zip"):
+        leftover.unlink(missing_ok=True)
+    retention_days = _retention_days()
+    if retention_days > 0:
+        app.state.retention_task = asyncio.create_task(retention_worker(retention_days))
     if os.environ.get("VIDEO_INSIGHT_PRELOAD", "false").strip().lower() in {
         "1", "true", "yes", "on"
     }:
@@ -90,9 +131,10 @@ async def start_analytics_store() -> None:
 @app.on_event("shutdown")
 async def stop_analytics_store() -> None:
     fleet_supervisor.stop()
-    task = getattr(app.state, "analytics_rollup_task", None)
-    if task is not None:
-        task.cancel()
+    for name in ("analytics_rollup_task", "retention_task"):
+        task = getattr(app.state, name, None)
+        if task is not None:
+            task.cancel()
     analytics_repository.close()
 
 
@@ -149,8 +191,8 @@ class StreamFrameRequest(BaseModel):
         return require_rtsp_url(value)
 
 
-class StreamVideoInsightRequest(BaseModel):
-    """Evaluate the two fixed questions over one live sampling window."""
+class StreamSamplingRequest(BaseModel):
+    """One live sampling window shared by the Qwen endpoints."""
 
     model_config = ConfigDict(extra="forbid")
 
@@ -164,8 +206,37 @@ class StreamVideoInsightRequest(BaseModel):
         return require_rtsp_url(value)
 
 
-class StreamFruitQualityRequest(StreamVideoInsightRequest):
+class StreamVideoInsightRequest(StreamSamplingRequest):
+    """Evaluate the two fixed questions over one live sampling window."""
+
+    include_thumbnail: bool = False
+
+
+class StreamFruitQualityRequest(StreamSamplingRequest):
     """Evaluate fruit freshness over one live sampling window."""
+
+    detail_level: Literal["summary", "detailed"] = "summary"
+    per_frame: bool = False
+    include_thumbnails: bool = False
+
+
+INSIGHT_UNAVAILABLE_DETAIL = "the analysis could not be completed; please try again"
+
+
+@contextmanager
+def _insight_errors() -> Iterator[None]:
+    """Map every insight failure to 503; only known messages reach the client."""
+
+    try:
+        yield
+    except HTTPException:
+        raise
+    except VideoInsightError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    except Exception as exc:  # noqa: BLE001 - e.g. CUDA or decoder errors must not be a 500
+        logger.exception("video insight request failed")
+        raise HTTPException(status_code=503, detail=INSIGHT_UNAVAILABLE_DETAIL) from exc
+
 
 @app.get("/health")
 def health() -> dict[str, object]:
@@ -180,6 +251,9 @@ def health() -> dict[str, object]:
             "cameras": fleet["cameras"],
             "running": fleet["running"],
         },
+        # Which model answers the insight requests and at what precision and
+        # image resolution; cheap, it never loads the model.
+        "insights": video_insight_service.describe(),
     }
 
 
@@ -351,6 +425,7 @@ async def interpret_recorded_video(
     num_frames: Annotated[int, Form(ge=2, le=16)] = 8,
     window_start_seconds: Annotated[float, Form(ge=0)] = 0,
     window_end_seconds: Annotated[float | None, Form(gt=0)] = None,
+    include_thumbnail: Annotated[bool, Form()] = False,
 ) -> dict[str, object]:
     """Evaluate the two fixed questions over a recorded-video time window."""
 
@@ -361,7 +436,7 @@ async def interpret_recorded_video(
         raise HTTPException(status_code=422, detail="window end must be after window start")
     JOBS_ROOT.mkdir(parents=True, exist_ok=True)
     try:
-        with tempfile.TemporaryDirectory(dir=JOBS_ROOT) as scratch_dir:
+        with _insight_errors(), tempfile.TemporaryDirectory(dir=JOBS_ROOT) as scratch_dir:
             video_path = Path(scratch_dir) / f"input{video_suffix}"
             await _save_upload(video, video_path, limit=MAX_UPLOAD_BYTES)
             from app.insights.service import extract_video_frames
@@ -374,11 +449,10 @@ async def interpret_recorded_video(
                 window_end_seconds=window_end_seconds,
             )
             result = await asyncio.to_thread(
-                video_insight_service.interpret,
+                video_insight_service.interpret_video,
                 frames,
+                include_thumbnail=include_thumbnail,
             )
-    except VideoInsightError as exc:
-        raise HTTPException(status_code=503, detail=str(exc)) from exc
     finally:
         await video.close()
     return {"data": result}
@@ -390,7 +464,7 @@ async def interpret_live_video(request: StreamVideoInsightRequest) -> dict[str, 
 
     from app.insights.service import extract_stream_frames
 
-    try:
+    with _insight_errors():
         frames = await asyncio.to_thread(
             extract_stream_frames,
             request.stream_url,
@@ -398,11 +472,10 @@ async def interpret_live_video(request: StreamVideoInsightRequest) -> dict[str, 
             sample_interval_seconds=request.interval_seconds / (request.num_frames - 1),
         )
         result = await asyncio.to_thread(
-            video_insight_service.interpret,
+            video_insight_service.interpret_video,
             frames,
+            include_thumbnail=request.include_thumbnail,
         )
-    except VideoInsightError as exc:
-        raise HTTPException(status_code=503, detail=str(exc)) from exc
     return {"data": result}
 
 
@@ -410,34 +483,43 @@ async def interpret_live_video(request: StreamVideoInsightRequest) -> dict[str, 
 async def interpret_fruit_quality(
     media: Annotated[UploadFile, File(...)],
     num_frames: Annotated[int, Form(ge=1, le=16)] = 8,
+    detail_level: Annotated[Literal["summary", "detailed"], Form()] = "summary",
+    per_frame: Annotated[bool, Form()] = False,
+    include_thumbnails: Annotated[bool, Form()] = False,
 ) -> dict[str, object]:
     """Score visible fruit freshness in one image or a sampled video."""
 
+    started = time.perf_counter()
     suffix = Path(media.filename or "").suffix.lower()
     if suffix not in ALLOWED_IMAGE_SUFFIXES | ALLOWED_VIDEO_SUFFIXES:
         raise HTTPException(status_code=422, detail="unsupported fruit image or video type")
     JOBS_ROOT.mkdir(parents=True, exist_ok=True)
     try:
-        with tempfile.TemporaryDirectory(dir=JOBS_ROOT) as scratch_dir:
+        with _insight_errors(), tempfile.TemporaryDirectory(dir=JOBS_ROOT) as scratch_dir:
             media_path = Path(scratch_dir) / f"input{suffix}"
             await _save_upload(media, media_path, limit=MAX_UPLOAD_BYTES)
             if suffix in ALLOWED_IMAGE_SUFFIXES:
-                from app.insights.service import extract_image_frame
+                from app.insights.service import sample_image_frame
 
-                frames = [await asyncio.to_thread(extract_image_frame, media_path)]
+                samples = await asyncio.to_thread(sample_image_frame, media_path)
             else:
-                from app.insights.service import extract_video_frames
+                from app.insights.service import sample_video_frames
 
-                frames = await asyncio.to_thread(
-                    extract_video_frames, media_path, num_frames=num_frames
+                samples = await asyncio.to_thread(
+                    sample_video_frames, media_path, num_frames=num_frames
                 )
             result = await asyncio.to_thread(
-                video_insight_service.interpret_fruit_quality, frames
+                video_insight_service.interpret_fruit_quality,
+                [item.image for item in samples],
+                detail_level=detail_level,
+                per_frame=per_frame,
+                include_thumbnails=include_thumbnails,
+                timestamps=[item.timestamp_seconds for item in samples],
             )
-    except VideoInsightError as exc:
-        raise HTTPException(status_code=503, detail=str(exc)) from exc
     finally:
         await media.close()
+    # Report the whole request, including the upload and frame sampling.
+    result["total_seconds"] = round(time.perf_counter() - started, 3)
     return {"data": result}
 
 
@@ -447,20 +529,26 @@ async def interpret_live_fruit_quality(
 ) -> dict[str, object]:
     """Score visible fruit freshness over one live-camera window."""
 
-    from app.insights.service import extract_stream_frames
+    from app.insights.service import sample_stream_frames
 
-    try:
-        frames = await asyncio.to_thread(
-            extract_stream_frames,
+    started = time.perf_counter()
+    with _insight_errors():
+        samples = await asyncio.to_thread(
+            sample_stream_frames,
             request.stream_url,
             num_frames=request.num_frames,
             sample_interval_seconds=request.interval_seconds / (request.num_frames - 1),
         )
         result = await asyncio.to_thread(
-            video_insight_service.interpret_fruit_quality, frames
+            video_insight_service.interpret_fruit_quality,
+            [item.image for item in samples],
+            detail_level=request.detail_level,
+            per_frame=request.per_frame,
+            include_thumbnails=request.include_thumbnails,
+            timestamps=[item.timestamp_seconds for item in samples],
         )
-    except VideoInsightError as exc:
-        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    # Report the whole request, including the live sampling window.
+    result["total_seconds"] = round(time.perf_counter() - started, 3)
     return {"data": result}
 
 
@@ -529,15 +617,18 @@ async def create_job(
                 raise HTTPException(status_code=422, detail="camera configuration must be YAML")
             config_path = job_directory / "camera.yaml"
             await _save_upload(camera_config, config_path, limit=2_000_000)
-        elif DEFAULT_CAMERA_CONFIG_PATH.exists():
+        elif _active_camera_config_path().exists():
+            # No upload: reuse the saved default, else the bundled example.
             config_path = job_directory / "camera.yaml"
-            shutil.copyfile(DEFAULT_CAMERA_CONFIG_PATH, config_path)
+            shutil.copyfile(_active_camera_config_path(), config_path)
         if config_path is not None:
             try:
                 load_camera_config(config_path)
             except (OSError, ValueError) as exc:
                 raise HTTPException(status_code=422, detail=f"invalid camera YAML: {exc}") from exc
-            if persist_camera_config:
+            # Only a real upload may replace the saved default; persisting the
+            # fallback copy would overwrite it with the bundled example.
+            if persist_camera_config and camera_config_upload is not None:
                 _save_default_camera_config(config_path)
         elif preset.module == "app.analytics.cli":
             config_path = job_directory / "camera.yaml"
@@ -754,6 +845,45 @@ def download_artifact(job_id: str, artifact_key: str) -> FileResponse:
         media_type=media_type,
         filename=path.name,
         content_disposition_type="inline" if media_type else "attachment",
+    )
+
+
+def _job_report(job_id: str) -> tuple[dict[str, object], Path, dict[str, str], str | None]:
+    try:
+        record = manager.get(job_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    job_dir = Path(record.job_directory)
+    report = build_job_report(record, job_dir, public_job=manager.public_dict(record))
+    input_video = record.input_video if record.source_type == "file" else None
+    return report, job_dir, dict(record.artifacts), input_video
+
+
+@app.get("/api/v1/jobs/{job_id}/report")
+def job_report(job_id: str) -> dict[str, object]:
+    """Configuration, final metrics, metric statistics and event counts of one job."""
+
+    report, _job_dir, _artifacts, _input_video = _job_report(job_id)
+    return {"data": report}
+
+
+@app.get("/api/v1/jobs/{job_id}/export.zip")
+def job_export(job_id: str) -> FileResponse:
+    """ZIP with report.json, metrics.csv and the job artifacts (never the upload)."""
+
+    report, job_dir, artifacts, input_video = _job_report(job_id)
+    JOBS_ROOT.mkdir(parents=True, exist_ok=True)
+    archive = JOBS_ROOT / f"{EXPORT_SCRATCH_PREFIX}{uuid4().hex}.zip"
+    try:
+        write_job_export_zip(archive, report, job_dir, artifacts, input_video=input_video)
+    except OSError as exc:
+        archive.unlink(missing_ok=True)
+        raise HTTPException(status_code=500, detail=f"could not build the export: {exc}") from exc
+    return FileResponse(
+        archive,
+        media_type="application/zip",
+        filename=f"job-{job_id}.zip",
+        background=BackgroundTask(archive.unlink, missing_ok=True),
     )
 
 
